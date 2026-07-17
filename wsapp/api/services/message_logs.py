@@ -334,6 +334,7 @@ def serialize_row(entry, serial_number=None):
         "sent_at": stamp(entry.sent_at),
         "delivered_at": stamp(entry.delivered_at),
         "read_at": stamp(entry.read_at),
+        "updated_at": stamp(entry.updated_at),
         "failed_at": stamp(entry.failed_at),
         "edited_at": stamp(entry.provider_edited_at),
         "deleted_at": stamp(entry.provider_deleted_at),

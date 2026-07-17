@@ -160,7 +160,7 @@ def select_phone_column(request, dataset_id):
 def preference_for(user):
     preference, _ = MessagingPreference.objects.get_or_create(
         owner=user,
-        defaults={"default_send_interval_seconds": max(0, min(int(settings.WASENDER_SEND_INTERVAL_SECONDS), 3600))},
+        defaults={"default_send_interval_seconds": max(settings.WASENDER_MIN_SEND_INTERVAL_SECONDS, min(int(settings.WASENDER_SEND_INTERVAL_SECONDS), 3600))},
     )
     return preference
 
@@ -316,7 +316,8 @@ def messaging_settings_save(request):
     data = json_body(request)
     try: interval = int(data.get("default_send_interval_seconds"))
     except (TypeError, ValueError): return error("Enter a whole number of seconds.", {"default_send_interval_seconds": ["Required."]})
-    if not 0 <= interval <= 3600: return error("Interval must be between 0 and 3600 seconds.", {"default_send_interval_seconds": ["Out of range."]})
+    if interval < settings.WASENDER_MIN_SEND_INTERVAL_SECONDS: return error(f"Minimum allowed interval is {settings.WASENDER_MIN_SEND_INTERVAL_SECONDS} seconds because account protection is enabled.", {"default_send_interval_seconds": [f"Minimum allowed interval is {settings.WASENDER_MIN_SEND_INTERVAL_SECONDS} seconds because account protection is enabled."]})
+    if interval > 3600: return error("Interval must be between 5 and 3600 seconds.", {"default_send_interval_seconds": ["Out of range."]})
     preference = preference_for(request.user)
     preference.default_send_interval_seconds = interval
     preference.auto_check_whatsapp_after_normalization = bool(data.get("auto_check_whatsapp_after_normalization"))
@@ -354,7 +355,8 @@ def campaign_create(request, dataset_id):
             return error("Media upload must finish before creating a campaign.", {"media_id": ["Upload failed or is incomplete."]})
     try: interval = int(data.get("send_interval_seconds", preference_for(request.user).default_send_interval_seconds))
     except (TypeError, ValueError): return error("Enter a valid send interval.", {"send_interval_seconds": ["Required."]})
-    if not 0 <= interval <= 3600: return error("Send interval must be between 0 and 3600 seconds.", {"send_interval_seconds": ["Out of range."]})
+    if interval < settings.WASENDER_MIN_SEND_INTERVAL_SECONDS: return error(f"Minimum allowed interval is {settings.WASENDER_MIN_SEND_INTERVAL_SECONDS} seconds because account protection is enabled.", {"send_interval_seconds": [f"Minimum allowed interval is {settings.WASENDER_MIN_SEND_INTERVAL_SECONDS} seconds because account protection is enabled."]})
+    if interval > 3600: return error("Send interval must be between 5 and 3600 seconds.", {"send_interval_seconds": ["Out of range."]})
     campaign = Campaign.objects.create(owner=request.user, dataset=dataset, name=data.get("name", "Untitled campaign")[:150], body_snapshot=data.get("body", ""), selected_phone_column=dataset.selected_phone_column, send_interval_seconds=interval, missing_value_policy=data.get("missing_value_policy", "empty"), missing_value_fallback=data.get("missing_value_fallback", ""), allow_duplicates=bool(data.get("allow_duplicates")), allow_unknown=bool(data.get("allow_unknown")), opt_in_confirmed=True, media=media, status=Campaign.Status.READY, send_config_snapshot={"interval_seconds": interval, "placeholders": detected})
     return ok({"id": str(campaign.id), "url": f"/campaigns/{campaign.id}/"})
 

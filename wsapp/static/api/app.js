@@ -221,10 +221,19 @@ const Waya = (() => {
       body.setRangeText(`{${event.target.value}}`, body.selectionStart, body.selectionEnd, "end");
       body.dispatchEvent(new Event("input"));
     };
-    document.querySelectorAll(".campaign-interval").forEach((button) => button.onclick = () => { document.querySelector("#sendInterval").value = button.dataset.value; });
+    const interval = document.querySelector("#sendInterval");
+    const validateInterval = () => {
+      const invalid = Number(interval.value) < 5;
+      interval.classList.toggle("is-invalid", invalid);
+      document.querySelectorAll(".campaign-interval").forEach((button) => button.classList.toggle("active", Number(button.dataset.value) === Number(interval.value)));
+      return !invalid;
+    };
+    document.querySelectorAll(".campaign-interval").forEach((button) => button.onclick = () => { interval.value = button.dataset.value; validateInterval(); });
+    interval.addEventListener("input", validateInterval); validateInterval();
     document.querySelector("#media").onchange = (event) => { const file = event.target.files[0]; document.querySelector("#mediaFeedback").textContent = file ? `${file.name} · ${file.type || "detected from file"} · ${Math.ceil(file.size / 1024)} KB` : ""; };
     document.querySelector("#campaignForm").onsubmit = async (event) => {
       event.preventDefault();
+      if (!validateInterval()) return;
       event.submitter.disabled = true;
       try {
         let media_id = "";
@@ -320,7 +329,7 @@ const Waya = (() => {
           <td><input type="checkbox" class="message-check" aria-label="Select message"></td><td>${row.sequence ?? "—"}</td>
           <td>${escapeHtml(row.phone_masked)}</td>
           <td><button class="btn btn-link p-0 text-start preview-cell" data-message-action="detail">${escapeHtml(row.preview)}</button></td>
-          <td><button class="badge status-badge state-${row.is_deleted ? "deleted" : escapeHtml(row.state)}" data-message-action="detail">${row.is_deleted ? "⌫ Deleted" : escapeHtml(row.state_label)}</button></td>
+          <td><span class="app-status app-status--${row.is_deleted ? "deleted" : escapeHtml(row.state)}">● ${row.is_deleted ? "Deleted" : escapeHtml(row.state_label)}</span></td>
           <td class="text-danger">${escapeHtml(row.error)}</td>
           <td class="text-end message-actions">
             <button class="btn btn-sm btn-outline-secondary" data-message-action="detail">View</button>
@@ -344,6 +353,9 @@ const Waya = (() => {
       try {
         const data = await request(`/campaigns/${id}/progress/`);
         render(data);
+        const protection = $("#providerProtection");
+        if (protection) protection.classList.toggle("d-none", !data.rate_limited);
+        if (data.rate_limited) toast("Provider protection paused sending for 5 seconds. Sending will resume automatically.");
         $("#liveDisconnect").classList.add("d-none");
         return data;
       } catch (error) {
@@ -501,16 +513,17 @@ const Waya = (() => {
       row.dataset.serial = serial;
       row.classList.add("message-row-updated");
       row.innerHTML = `
+        <td><input class="message-check" type="checkbox" value="${escapeHtml(data.id)}" aria-label="Select message"></td>
         <td class="message-serial">${escapeHtml(serial)}</td>
         <td><span class="message-phone">${escapeHtml(data.phone)}</span><button type="button" class="btn btn-sm btn-link copy-phone" data-phone="${escapeHtml(data.phone)}" aria-label="Copy phone">⧉</button></td>
         <td><button type="button" class="btn btn-link p-0 text-start message-preview" data-message-action="detail">${escapeHtml(data.message.length > 90 ? `${data.message.slice(0, 90)}…` : data.message)}</button></td>
-        <td><button class="badge status-badge state-${escapeHtml(data.state)}" data-message-action="detail">${statusIcon(data.state)} ${escapeHtml(data.state_label)}</button><small class="d-block text-muted delivery-note">${escapeHtml(data.delivery_explanation)}</small></td>
+        <td class="message-campaign">${escapeHtml(data.campaign_name)}</td>
+        <td><span class="app-status app-status--${escapeHtml(data.state)}">● ${escapeHtml(data.state_label)}</span></td>
+        <td class="message-time">${escapeHtml(formatDate(data.sent_at || data.updated_at))}</td>
         <td class="text-end message-actions">
           ${actionButton("detail", "View", "btn-outline-secondary")}
           ${actionButton("refresh", "↻", "btn-outline-primary", data.can_refresh_status)}
-          ${actionButton("update", "Update", "btn-outline-secondary", data.can_update)}
-          ${actionButton("delete", "Delete", "btn-outline-danger", data.can_delete)}
-          ${data.can_resend ? actionButton("resend", "Resend", "btn-warning") : ""}
+          <details class="action-more"><summary class="btn btn-sm btn-outline-secondary">More</summary><div>${actionButton("update", "Update", "btn-outline-secondary", data.can_update)} ${actionButton("delete", "Delete", "btn-outline-danger", data.can_delete)} ${data.can_resend ? actionButton("resend", "Resend", "btn-warning") : ""}</div></details>
         </td>`;
       setTimeout(() => row.classList.remove("message-row-updated"), 1400);
     }
@@ -680,6 +693,7 @@ const Waya = (() => {
     rows.addEventListener("change", (event) => { if (event.target.classList.contains("message-check")) redrawBulk(); });
     document.querySelector("#messageVisibleAll")?.addEventListener("change", (event) => { rows.querySelectorAll(".message-check").forEach((box) => { box.checked = event.target.checked; }); redrawBulk(); });
     document.querySelector("#bulkClear")?.addEventListener("click", () => { rows.querySelectorAll(".message-check").forEach((box) => { box.checked = false; }); redrawBulk(); });
+    document.querySelector("#messageSelectPage")?.addEventListener("click", () => { rows.querySelectorAll(".message-check").forEach((box) => { box.checked = true; }); redrawBulk(); });
     async function sequential(action) { const selected = selectedRows(); for (let i = 0; i < selected.length; i += 1) { const row = selected[i]; const actionButton = row.querySelector(`[data-message-action="${action}"]`); if (!actionButton || actionButton.disabled) continue; try { await postAction(row, action === "refresh" ? "refresh-status" : action); row.querySelector(".message-check").checked = false; } catch (error) { toast(`${i + 1}/${selected.length}: ${error.message}`); } } redrawBulk(); }
     document.querySelector("#bulkRefresh")?.addEventListener("click", () => sequential("refresh"));
     document.querySelector("#bulkDelete")?.addEventListener("click", () => sequential("delete"));
@@ -687,8 +701,10 @@ const Waya = (() => {
   }
 
   function messagingSettings() {
-    document.querySelectorAll(".interval-preset").forEach((button) => button.onclick = () => { document.querySelector("#defaultInterval").value = button.dataset.value; });
-    document.querySelector("#messagingSettingsForm").onsubmit = async (event) => { event.preventDefault(); const feedback = document.querySelector("#settingsFeedback"); try { const data = await request("/settings/messaging/save/", {method:"POST", body:JSON.stringify({default_send_interval_seconds:document.querySelector("#defaultInterval").value, auto_check_whatsapp_after_normalization:document.querySelector("#autoCheck").checked})}); feedback.className="small mt-3 text-success"; feedback.textContent=`Saved: ${data.default_send_interval_seconds} seconds.`; } catch (error) { feedback.className="small mt-3 text-danger"; feedback.textContent=error.message; } };
+    const input = document.querySelector("#defaultInterval"), feedback = document.querySelector("#settingsFeedback");
+    const validate = () => { const invalid = Number(input.value) < 5; input.classList.toggle("is-invalid", invalid); feedback.className = `small mt-2 ${invalid ? "text-danger" : ""}`; feedback.textContent = invalid ? "Minimum allowed interval is 5 seconds because account protection is enabled." : ""; document.querySelectorAll(".interval-preset").forEach((button) => button.classList.toggle("active", Number(button.dataset.value) === Number(input.value))); return !invalid; };
+    document.querySelectorAll(".interval-preset").forEach((button) => button.onclick = () => { input.value = button.dataset.value; validate(); }); input.addEventListener("input", validate); validate();
+    document.querySelector("#messagingSettingsForm").onsubmit = async (event) => { event.preventDefault(); if (!validate()) return; try { const data = await request("/settings/messaging/save/", {method:"POST", body:JSON.stringify({default_send_interval_seconds:input.value, auto_check_whatsapp_after_normalization:document.querySelector("#autoCheck").checked})}); feedback.className="small mt-2 text-success"; feedback.textContent=`Saved: ${data.default_send_interval_seconds} seconds.`; } catch (error) { feedback.className="small mt-2 text-danger"; feedback.textContent=error.message; } };
   }
   return { request, toast, uploadForm, dataset, campaignForm, campaign, messageLogs, messagingSettings };
 })();

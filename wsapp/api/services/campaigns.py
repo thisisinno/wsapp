@@ -12,7 +12,7 @@ from django.utils import timezone
 from api.models import Campaign, CampaignRecipient, ImportedRecipient, MessageAttempt
 from api.services.media import ensure_media_ready
 from api.services.templates import render_message
-from api.services.wasender import WasenderClient, WasenderError, safe_provider_payload
+from api.services.wasender import WasenderClient, WasenderError, safe_provider_payload, safe_provider_text
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +33,33 @@ SENDABLE_STATES = ATTEMPTED_STATES | {
 
 
 def campaign_interval_seconds(campaign):
-    """The only send cadence policy.  Never infer a trial minimum."""
+    """The only send cadence policy, including malformed legacy values."""
     try:
-        return max(0, min(int(campaign.send_interval_seconds), 3600))
+        value = int(campaign.send_interval_seconds)
     except (TypeError, ValueError):
-        return 1
+        value = settings.WASENDER_MIN_SEND_INTERVAL_SECONDS
+    return max(settings.WASENDER_MIN_SEND_INTERVAL_SECONDS, min(value, 3600))
+
+
+def provider_rate_limited(exc):
+    """Recognise protection responses even when a provider omits HTTP 429."""
+    message = safe_provider_text(exc).lower()
+    payload = getattr(exc, "payload", {}) or {}
+    category = str(getattr(exc, "category", "") or payload.get("category", "")).lower()
+    return (
+        getattr(exc, "status", None) == 429
+        or "rate" in category and "limit" in category
+        or "only send 1 message every 5 seconds" in message
+        or "account protection enabled" in message
+    )
+
+
+def provider_retry_seconds(exc):
+    try:
+        retry = int(getattr(exc, "retry_after", None) or (getattr(exc, "payload", {}) or {}).get("retry_after") or 0)
+    except (TypeError, ValueError):
+        retry = 0
+    return max(settings.WASENDER_MIN_SEND_INTERVAL_SECONDS, retry)
 
 
 def recalculate_campaign(campaign_id, finalize=True):
@@ -353,17 +375,22 @@ def send_next(campaign_id, owner_id, run_token):
     except WasenderError as exc:
         with transaction.atomic():
             locked = CampaignRecipient.objects.select_for_update().get(pk=entry.pk)
-            locked.state = CampaignRecipient.State.FAILED
-            locked.failed_at = timezone.now()
+            is_rate_limited = provider_rate_limited(exc)
+            retry_seconds = provider_retry_seconds(exc) if is_rate_limited else 0
+            locked.state = CampaignRecipient.State.QUEUED if is_rate_limited else CampaignRecipient.State.FAILED
+            locked.failed_at = None if is_rate_limited else timezone.now()
             locked.attempt_finished_at = timezone.now()
-            locked.skip_reason = str(exc)[:255]
+            locked.scheduled_for = timezone.now() + timedelta(seconds=retry_seconds) if is_rate_limited else None
+            locked.skip_reason = "Provider protection requires a 5-second delay." if is_rate_limited else safe_provider_text(exc)[:255]
             locked.save()
             attempt.http_status = exc.status
             attempt.provider_response = _safe_provider_payload(exc.payload)
-            attempt.error_category = exc.category
-            attempt.error_message = str(exc)[:1000]
+            attempt.error_category = "rate_limited" if is_rate_limited else exc.category
+            attempt.error_message = locked.skip_reason
             attempt.duration_ms = int((time.monotonic() - started) * 1000)
             attempt.save()
+            if is_rate_limited:
+                result_name = "rate_limited"
     except Exception:
         # Log a traceback-shaped safe diagnostic without interpolating the
         # original exception, which may contain a provider response.
@@ -394,17 +421,32 @@ def send_next(campaign_id, owner_id, run_token):
             ).first()
             wait_seconds = campaign_interval_seconds(campaign) if next_entry else 0
             if next_entry:
-                next_entry.scheduled_for = timezone.now() + timedelta(seconds=wait_seconds)
+                # Keep a provider-requested delay; never shorten it.
+                scheduled_for = timezone.now() + timedelta(seconds=wait_seconds)
+                if next_entry.scheduled_for and next_entry.scheduled_for > scheduled_for:
+                    scheduled_for = next_entry.scheduled_for
+                next_entry.scheduled_for = scheduled_for
                 next_entry.save(update_fields=["scheduled_for", "updated_at"])
+                wait_seconds = max(
+                    settings.WASENDER_MIN_SEND_INTERVAL_SECONDS,
+                    int((scheduled_for - timezone.now()).total_seconds() + 0.999),
+                )
             else:
                 recalculate_campaign(campaign.id, finalize=True)
-    return {
+    response = {
         "sent_now": True,
         "attempted_sequence": sequence,
         "attempt_result": result_name,
         "wait_seconds": wait_seconds,
         "finished": not bool(next_entry),
     }
+    if result_name == "rate_limited":
+        response.update({
+            "rate_limited": True,
+            "wait_seconds": max(wait_seconds, settings.WASENDER_MIN_SEND_INTERVAL_SECONDS),
+            "message": "Provider protection requires a 5-second delay.",
+        })
+    return response
 
 
 def preflight_next(campaign_id, owner_id, run_token):

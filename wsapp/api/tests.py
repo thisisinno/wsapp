@@ -1,6 +1,7 @@
 import io
 import json
 from pathlib import Path
+from datetime import timedelta
 from unittest.mock import Mock, patch
 
 import requests
@@ -144,6 +145,9 @@ class CampaignSequentialTests(TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["data"]["progress_text"], f"{number}/4")
             self.assertEqual(send.call_count, number)
+            CampaignRecipient.objects.filter(campaign=self.campaign).exclude(
+                attempt_started_at__isnull=True
+            ).update(attempt_started_at=timezone.now() - timedelta(seconds=6))
         self.assertTrue(response.json()["data"]["finished"])
 
     @patch("api.services.campaigns.WasenderClient.check_number")
@@ -171,6 +175,26 @@ class CampaignSequentialTests(TestCase):
         self.assertGreater(second["wait_seconds"], 0)
         self.assertEqual(send.call_count, 1)
 
+    @patch("api.services.campaigns.WasenderClient.send_message")
+    def test_provider_protection_requeues_without_permanent_failure(self, send):
+        send.side_effect = RateLimitError(
+            "You have account protection enabled. You can only send 1 message every 5 seconds.",
+            429,
+            {"retry_after": 7},
+            7,
+        )
+        token = self.start().json()["data"]["run_token"]
+        response = self.next(token)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertTrue(data["rate_limited"])
+        self.assertGreaterEqual(data["wait_seconds"], 7)
+        entry = self.campaign.campaign_recipients.order_by("sequence_number").first()
+        entry.refresh_from_db()
+        self.assertEqual(entry.state, "queued")
+        self.assertIsNone(entry.failed_at)
+        self.assertEqual(entry.attempts.last().error_category, "rate_limited")
+
     @patch("api.services.campaigns.WasenderClient.check_number")
     @patch("api.services.campaigns.WasenderClient.send_message")
     def test_idempotent_start_resume_token_and_no_duplicate_accepted(self, send, check):
@@ -181,6 +205,9 @@ class CampaignSequentialTests(TestCase):
         self.assertNotEqual(first["run_token"], second["run_token"])
         self.assertEqual(self.campaign.campaign_recipients.count(), 4)
         self.next(second["run_token"])
+        CampaignRecipient.objects.filter(campaign=self.campaign).exclude(
+            attempt_started_at__isnull=True
+        ).update(attempt_started_at=timezone.now() - timedelta(seconds=6))
         self.client.post(
             reverse("campaign_action", args=[self.campaign.id, "pause"]),
             data="{}",
@@ -639,6 +666,7 @@ class MessageLogTests(TestCase):
         self.assertEqual(self.entry.attempts.count(), 1)
         self.entry.state = "failed"
         self.entry.failed_at = timezone.now()
+        self.entry.attempt_started_at = timezone.now() - timedelta(seconds=6)
         self.entry.save()
         send.return_value = ProviderResult(
             {"success": True, "data": {"msgId": "fresh", "status": "in_progress"}}, 200
