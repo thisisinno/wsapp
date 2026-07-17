@@ -43,3 +43,5 @@
   .message-actions .btn { margin-bottom: .25rem; }
   .message-preview { min-width: 14rem; }
 }
+.app-table-card{background:#fff;border:1px solid #ece8f1;border-radius:14px;box-shadow:0 4px 18px rgba(49,35,73,.04)}
+.app-table{margin-bottom:0}.app-table thead th{position:sticky;top:0;z-index:2;background:#fff;white-space:nowrap}.app-table th:first-child,.app-table td:first-child{width:42px}.app-table tbody tr{height:54px}.app-table tbody tr:hover{background:#faf7ff}.app-table-toolbar,.app-table-selection{flex-wrap:wrap}.app-table-selection{position:sticky;top:68px;z-index:3;display:flex;gap:.5rem;align-items:center;padding:.65rem;background:#f8f4ff;border:1px solid #e7dafa;border-radius:.75rem;margin-bottom:1rem}.app-status-badge{border-radius:999px}.app-actions{display:flex;gap:.35rem;flex-wrap:wrap}.app-empty-state{padding:3rem;text-align:center;color:#777}.message-phone{font-variant-numeric:tabular-nums}.btn{min-height:34px;border-radius:.55rem}.btn:focus-visible{box-shadow:0 0 0 .25rem rgba(182,109,255,.3)}.btn.disabled,.btn:disabled{pointer-events:none;opacity:.55}

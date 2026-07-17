@@ -1,6 +1,8 @@
 import hashlib
 import json
 import uuid
+import mimetypes
+from datetime import timedelta
 from pathlib import Path
 
 from django.conf import settings
@@ -17,12 +19,12 @@ from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST
 from openpyxl import Workbook
 
-from .models import Campaign, CampaignRecipient, ImportedRecipient, MessageTemplate, UploadedDataset, UploadedMedia
+from .models import Campaign, CampaignRecipient, ImportedRecipient, MessageTemplate, MessagingPreference, UploadedDataset, UploadedMedia
 from .services.imports import checksum, workbook_sheets
 from .services.campaigns import (
     ATTEMPTED_STATES,
     SENDABLE_STATES,
-    preflight_next,
+    check_recipient, preflight_next,
     queue_campaign_entries,
     recalculate_campaign,
     resume_campaign,
@@ -149,12 +151,24 @@ def select_phone_column(request, dataset_id):
     column = data.get("column")
     if column not in {c["key"] for c in dataset.detected_columns}: return error("Unknown column.", {"column": ["Choose a detected column."]})
     normalize_dataset(str(dataset.id), column)
-    return ok(recipient_counts(dataset), "Numbers normalized.")
+    dataset.refresh_from_db()
+    data = recipient_counts(dataset)
+    data.update({"selected_phone_column": dataset.selected_phone_column, "can_compose": True, "selected": data["selected"], "auto_check": preference_for(request.user).auto_check_whatsapp_after_normalization})
+    return ok(data, "Numbers normalized.")
+
+
+def preference_for(user):
+    preference, _ = MessagingPreference.objects.get_or_create(
+        owner=user,
+        defaults={"default_send_interval_seconds": max(0, min(int(settings.WASENDER_SEND_INTERVAL_SECONDS), 3600))},
+    )
+    return preference
 
 
 def recipient_counts(dataset):
     values = dict(dataset.recipients.values("phone_validation_status").annotate(n=Count("id")).values_list("phone_validation_status", "n"))
-    return {**values, "duplicate": dataset.recipients.exclude(duplicate_of=None).count(), "suppressed": dataset.recipients.filter(suppressed=True).count(), "selected": dataset.recipients.filter(selected=True).count()}
+    whatsapp = dict(dataset.recipients.values("whatsapp_state").annotate(n=Count("id")).values_list("whatsapp_state", "n"))
+    return {**values, **{f"whatsapp_{key}": value for key, value in whatsapp.items()}, "duplicate": dataset.recipients.exclude(duplicate_of=None).count(), "suppressed": dataset.recipients.filter(suppressed=True).count(), "selected": dataset.recipients.filter(selected=True).count()}
 
 
 @login_required
@@ -169,11 +183,12 @@ def recipients(request, dataset_id):
         "unchecked": Q(whatsapp_state__in=["unknown", "error"]), "duplicate": Q(duplicate_of__isnull=False),
         "suppressed": Q(suppressed=True), "failed": Q(campaign_entries__state="failed"),
     }
+    if filter_name != "all" and filter_name not in filters: return error("Unknown recipient filter.", status=400)
     if filter_name in filters: queryset = queryset.filter(filters[filter_name])
     page, size = max(1, int(request.GET.get("page", 1))), min(100, max(1, int(request.GET.get("page_size", 25))))
     total = queryset.distinct().count()
     rows = queryset.distinct()[(page - 1) * size:page * size]
-    data = [{"id": str(r.id), "row_number": r.original_row_number, "row": r.row_data, "phone_original": r.phone_original, "phone_normalized": r.phone_normalized, "validation": r.phone_validation_status, "error": r.validation_error_message, "selected": r.selected, "whatsapp": r.whatsapp_state, "duplicate": bool(r.duplicate_of_id), "suppressed": r.suppressed} for r in rows]
+    data = [{"id": str(r.id), "row_number": r.original_row_number, "row": r.row_data, "phone_original": r.phone_original, "phone_normalized": r.phone_normalized, "validation": r.phone_validation_status, "error": r.validation_error_message, "selected": r.selected, "whatsapp": r.whatsapp_state, "whatsapp_error": r.validation_error_message if r.whatsapp_state == "error" else "", "duplicate": bool(r.duplicate_of_id), "suppressed": r.suppressed} for r in rows]
     return ok({"rows": data, "page": page, "page_size": size, "total": total, "counts": recipient_counts(dataset)})
 
 
@@ -189,8 +204,10 @@ def edit_phone(request, recipient_id):
     recipient.validation_error_message, recipient.auto_corrected = result.message, result.auto_corrected
     recipient.row_data[recipient.phone_source_column] = new
     recipient.suppressed = bool(result.normalized and request.user.suppressions.filter(normalized_phone=result.normalized).exists())
+    recipient.whatsapp_state = ImportedRecipient.WhatsApp.UNKNOWN
+    recipient.whatsapp_checked_at = None
     recipient.save()
-    return ok({"id": str(recipient.id), "old": old, "new": new, "normalized": result.normalized, "validation": result.status, "error": result.message, "counts": recipient_counts(recipient.dataset)})
+    return ok({"id": str(recipient.id), "old": old, "new": new, "normalized": result.normalized, "validation": result.status, "error": result.message, "whatsapp": recipient.whatsapp_state, "should_check": result.status in {"valid", "warning"} and bool(result.normalized) and preference_for(request.user).auto_check_whatsapp_after_normalization, "counts": recipient_counts(recipient.dataset)})
 
 
 @login_required
@@ -221,15 +238,90 @@ def selection(request, dataset_id):
     if action == "set":
         ids = data.get("ids", [])
         qs.filter(id__in=ids).update(selected=bool(data.get("selected")))
+    elif action == "visible": qs.filter(id__in=data.get("ids", [])).update(selected=bool(data.get("selected", True)))
     elif action == "clear": qs.update(selected=False)
     elif action == "all": qs.update(selected=True)
+    elif action == "valid": qs.update(selected=False); qs.filter(phone_validation_status__in=["valid", "warning"]).update(selected=True)
+    elif action == "whatsapp_exists": qs.update(selected=False); qs.filter(whatsapp_state="exists").update(selected=True)
     elif action == "matching":
         filter_name = data.get("filter", "all")
-        mapping = {"valid": Q(phone_validation_status__in=["valid", "warning"]), "invalid": Q(phone_validation_status__in=["invalid", "blank"]), "exists": Q(whatsapp_state="exists"), "duplicate": Q(duplicate_of__isnull=False), "suppressed": Q(suppressed=True)}
+        mapping = {"all": Q(), "valid": Q(phone_validation_status__in=["valid", "warning"]), "invalid": Q(phone_validation_status__in=["invalid", "blank"]), "exists": Q(whatsapp_state="exists"), "not_exists": Q(whatsapp_state="not_exists"), "unchecked": Q(whatsapp_state__in=["unknown", "error"]), "duplicate": Q(duplicate_of__isnull=False), "suppressed": Q(suppressed=True)}
+        if filter_name not in mapping: return error("Unknown recipient filter.", status=400)
         qs.update(selected=False)
         qs.filter(mapping.get(filter_name, Q())).update(selected=True)
     else: return error("Unknown selection action.")
-    return ok({"selected": dataset.recipients.filter(selected=True).count()})
+    return ok({"selected": dataset.recipients.filter(selected=True).count(), "total": dataset.recipients.count(), "counts": recipient_counts(dataset)})
+
+
+@login_required
+@require_POST
+def whatsapp_check_start(request, dataset_id):
+    dataset = get_object_or_404(UploadedDataset, pk=dataset_id, owner=request.user)
+    dataset.whatsapp_check_paused = False
+    dataset.save(update_fields=["whatsapp_check_paused", "updated_at"])
+    return ok(whatsapp_progress(dataset), "WhatsApp checks ready.")
+
+
+def whatsapp_progress(dataset):
+    fresh = timezone.now() - timedelta(seconds=settings.WASENDER_CHECK_CACHE_SECONDS)
+    eligible = dataset.recipients.filter(phone_validation_status__in=["valid", "warning"]).exclude(phone_normalized="")
+    total = eligible.count()
+    checked = eligible.filter(whatsapp_checked_at__gte=fresh, whatsapp_state__in=["exists", "not_exists"]).count()
+    pending = eligible.filter(Q(whatsapp_checked_at__isnull=True) | Q(whatsapp_checked_at__lt=fresh) | Q(whatsapp_state="error")).count()
+    return {"total": total, "checked": checked, "pending": pending, "paused": dataset.whatsapp_check_paused, "percent": round(checked * 100 / total, 1) if total else 100}
+
+
+@login_required
+@require_GET
+def whatsapp_check_progress(request, dataset_id):
+    return ok(whatsapp_progress(get_object_or_404(UploadedDataset, pk=dataset_id, owner=request.user)))
+
+
+@login_required
+@require_POST
+def whatsapp_check_pause(request, dataset_id):
+    dataset = get_object_or_404(UploadedDataset, pk=dataset_id, owner=request.user)
+    dataset.whatsapp_check_paused = True
+    dataset.save(update_fields=["whatsapp_check_paused", "updated_at"])
+    return ok(whatsapp_progress(dataset), "WhatsApp checks paused.")
+
+
+@login_required
+@require_POST
+def whatsapp_check_next(request, dataset_id):
+    dataset = get_object_or_404(UploadedDataset, pk=dataset_id, owner=request.user)
+    if dataset.whatsapp_check_paused:
+        return ok({**whatsapp_progress(dataset), "paused": True})
+    fresh = timezone.now() - timedelta(seconds=settings.WASENDER_CHECK_CACHE_SECONDS)
+    with transaction.atomic():
+        recipient = dataset.recipients.select_for_update().filter(phone_validation_status__in=["valid", "warning"]).exclude(phone_normalized="").filter(Q(whatsapp_checked_at__isnull=True) | Q(whatsapp_checked_at__lt=fresh) | Q(whatsapp_state="error")).order_by("original_row_number").first()
+        if not recipient:
+            return ok({**whatsapp_progress(dataset), "finished": True})
+        recipient.whatsapp_state = ImportedRecipient.WhatsApp.CHECKING
+        recipient.save(update_fields=["whatsapp_state", "updated_at"])
+    state = check_recipient(recipient)
+    recipient.refresh_from_db()
+    return ok({**whatsapp_progress(dataset), "recipient": {"id": str(recipient.id), "whatsapp": state, "error": recipient.validation_error_message if state == "error" else ""}, "checked_now": True})
+
+
+@login_required
+@ensure_csrf_cookie
+def messaging_settings(request):
+    return render(request, "api/messaging_settings.html", {"preference": preference_for(request.user)})
+
+
+@login_required
+@require_POST
+def messaging_settings_save(request):
+    data = json_body(request)
+    try: interval = int(data.get("default_send_interval_seconds"))
+    except (TypeError, ValueError): return error("Enter a whole number of seconds.", {"default_send_interval_seconds": ["Required."]})
+    if not 0 <= interval <= 3600: return error("Interval must be between 0 and 3600 seconds.", {"default_send_interval_seconds": ["Out of range."]})
+    preference = preference_for(request.user)
+    preference.default_send_interval_seconds = interval
+    preference.auto_check_whatsapp_after_normalization = bool(data.get("auto_check_whatsapp_after_normalization"))
+    preference.save()
+    return ok({"default_send_interval_seconds": interval, "auto_check_whatsapp_after_normalization": preference.auto_check_whatsapp_after_normalization}, "Messaging settings saved.")
 
 
 @login_required
@@ -241,7 +333,7 @@ def campaigns(request):
 @ensure_csrf_cookie
 def campaign_new(request, dataset_id):
     dataset = get_object_or_404(UploadedDataset, pk=dataset_id, owner=request.user)
-    return render(request, "api/campaign_form.html", {"dataset": dataset})
+    return render(request, "api/campaign_form.html", {"dataset": dataset, "preference": preference_for(request.user), "preview_counts": recipient_counts(dataset)})
 
 
 @login_required
@@ -249,6 +341,8 @@ def campaign_new(request, dataset_id):
 def campaign_create(request, dataset_id):
     dataset = get_object_or_404(UploadedDataset, pk=dataset_id, owner=request.user)
     data = json_body(request)
+    if not dataset.selected_phone_column:
+        return error("Select and normalize a phone column before creating a campaign.", {"phone_column": ["Required."]})
     if not data.get("opt_in_confirmed"): return error("Confirm recipient opt-in before sending.", {"opt_in_confirmed": ["Required."]})
     allowed = {c["key"] for c in dataset.detected_columns}
     try: detected = validate_template(data.get("body", ""), allowed)
@@ -256,7 +350,12 @@ def campaign_create(request, dataset_id):
     media = None
     if data.get("media_id"):
         media = get_object_or_404(UploadedMedia, pk=data["media_id"], owner=request.user)
-    campaign = Campaign.objects.create(owner=request.user, dataset=dataset, name=data.get("name", "Untitled campaign")[:150], body_snapshot=data.get("body", ""), selected_phone_column=dataset.selected_phone_column, missing_value_policy=data.get("missing_value_policy", "empty"), missing_value_fallback=data.get("missing_value_fallback", ""), allow_duplicates=bool(data.get("allow_duplicates")), allow_unknown=bool(data.get("allow_unknown")), opt_in_confirmed=True, media=media, status=Campaign.Status.READY, send_config_snapshot={"trial_mode": settings.WASENDER_TRIAL_MODE, "interval": settings.WASENDER_SEND_INTERVAL_SECONDS, "placeholders": detected})
+        if media.upload_status != UploadedMedia.Status.READY:
+            return error("Media upload must finish before creating a campaign.", {"media_id": ["Upload failed or is incomplete."]})
+    try: interval = int(data.get("send_interval_seconds", preference_for(request.user).default_send_interval_seconds))
+    except (TypeError, ValueError): return error("Enter a valid send interval.", {"send_interval_seconds": ["Required."]})
+    if not 0 <= interval <= 3600: return error("Send interval must be between 0 and 3600 seconds.", {"send_interval_seconds": ["Out of range."]})
+    campaign = Campaign.objects.create(owner=request.user, dataset=dataset, name=data.get("name", "Untitled campaign")[:150], body_snapshot=data.get("body", ""), selected_phone_column=dataset.selected_phone_column, send_interval_seconds=interval, missing_value_policy=data.get("missing_value_policy", "empty"), missing_value_fallback=data.get("missing_value_fallback", ""), allow_duplicates=bool(data.get("allow_duplicates")), allow_unknown=bool(data.get("allow_unknown")), opt_in_confirmed=True, media=media, status=Campaign.Status.READY, send_config_snapshot={"interval_seconds": interval, "placeholders": detected})
     return ok({"id": str(campaign.id), "url": f"/campaigns/{campaign.id}/"})
 
 
@@ -266,11 +365,13 @@ def media_create(request):
     file = request.FILES.get("file")
     if not file: return error("Choose a media file.", {"file": ["Required."]})
     mime = (file.content_type or "").lower()
+    guessed, _ = mimetypes.guess_type(file.name)
+    if not mime or mime == "application/octet-stream": mime = (guessed or "").lower()
     types = {
         "image/jpeg": "image", "image/png": "image", "image/webp": "image",
         "video/mp4": "video", "audio/mpeg": "audio", "audio/ogg": "audio",
         "application/pdf": "document", "application/msword": "document",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "document",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "document", "application/vnd.ms-excel": "document", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "document", "text/csv": "document", "text/plain": "document",
     }
     if mime not in types: return error("Unsupported media type.", {"file": ["Use JPEG, PNG, WebP, MP4, MP3, OGG, PDF, DOC or DOCX."]})
     if file.size > settings.MEDIA_MAX_BYTES: return error("Media is too large.")

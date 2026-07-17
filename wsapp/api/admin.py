@@ -1,7 +1,7 @@
 from django.contrib import admin
 from .models import (Campaign, CampaignRecipient, ImportedRecipient, LiveIntegrationResult,
                      MessageAttempt, MessageTemplate, SuppressedRecipient, UploadedDataset,
-                     UploadedMedia, WebhookEvent)
+                     UploadedMedia, WebhookEvent, MessagingPreference)
 
 
 @admin.register(UploadedDataset)
@@ -50,3 +50,4 @@ class WebhookAdmin(admin.ModelAdmin):
 
 
 admin.site.register([MessageTemplate, UploadedMedia, SuppressedRecipient, LiveIntegrationResult])
+admin.site.register(MessagingPreference)

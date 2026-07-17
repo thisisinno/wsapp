@@ -32,6 +32,14 @@ SENDABLE_STATES = ATTEMPTED_STATES | {
 }
 
 
+def campaign_interval_seconds(campaign):
+    """The only send cadence policy.  Never infer a trial minimum."""
+    try:
+        return max(0, min(int(campaign.send_interval_seconds), 3600))
+    except (TypeError, ValueError):
+        return 1
+
+
 def recalculate_campaign(campaign_id, finalize=True):
     campaign = Campaign.objects.get(pk=campaign_id)
     counts = dict(
@@ -105,6 +113,16 @@ def queue_campaign_entries(campaign):
         elif recipient.suppressed:
             state = CampaignRecipient.State.SKIPPED
             reason = "Suppressed recipient"
+        elif recipient.whatsapp_state == ImportedRecipient.WhatsApp.NOT_EXISTS:
+            state = CampaignRecipient.State.SKIPPED
+            reason = "Number is not registered on WhatsApp."
+        elif recipient.whatsapp_state in {
+            ImportedRecipient.WhatsApp.UNKNOWN,
+            ImportedRecipient.WhatsApp.CHECKING,
+            ImportedRecipient.WhatsApp.ERROR,
+        } and not campaign.allow_unknown:
+            state = CampaignRecipient.State.SKIPPED
+            reason = "WhatsApp registration has not been confirmed."
         elif rendered is None:
             state = CampaignRecipient.State.SKIPPED
             reason = f"Missing values: {', '.join(missing)}"
@@ -203,13 +221,6 @@ def check_recipient(recipient, client=None):
     return recipient.whatsapp_state
 
 
-def _interval_seconds():
-    return max(
-        60 if settings.WASENDER_TRIAL_MODE else 0,
-        settings.WASENDER_SEND_INTERVAL_SECONDS,
-    )
-
-
 def recover_stale_processing(campaign_id):
     cutoff = timezone.now() - timedelta(
         seconds=settings.WASENDER_CONNECT_TIMEOUT
@@ -265,12 +276,15 @@ def send_next(campaign_id, owner_id, run_token):
         if busy:
             return {"busy": True, "retry_after": 2}
         latest = (
-            MessageAttempt.objects.filter(campaign_recipient__campaign__owner_id=owner_id)
-            .order_by("-created_at")
+            MessageAttempt.objects.filter(
+                campaign_recipient__campaign__owner_id=owner_id,
+                campaign_recipient__attempt_started_at__isnull=False,
+            )
+            .order_by("-campaign_recipient__attempt_started_at")
             .first()
         )
         if latest:
-            next_allowed = latest.created_at + timedelta(seconds=_interval_seconds())
+            next_allowed = latest.campaign_recipient.attempt_started_at + timedelta(seconds=campaign_interval_seconds(campaign))
             if next_allowed > now:
                 return {
                     "wait_seconds": max(
@@ -378,7 +392,7 @@ def send_next(campaign_id, owner_id, run_token):
             next_entry = campaign.campaign_recipients.filter(state="queued").order_by(
                 "sequence_number", "created_at"
             ).first()
-            wait_seconds = _interval_seconds() if next_entry else 0
+            wait_seconds = campaign_interval_seconds(campaign) if next_entry else 0
             if next_entry:
                 next_entry.scheduled_for = timezone.now() + timedelta(seconds=wait_seconds)
                 next_entry.save(update_fields=["scheduled_for", "updated_at"])

@@ -15,7 +15,7 @@ python manage.py runserver 0.0.0.0:9000
 
 Open the application through the forwarded port 9000 URL. Local HTTP/HTTPS port
 9000 and GitHub Codespaces `app.github.dev` origins are trusted for Django CSRF.
-The temporary private-trial Wasender key is configured server-side in
+The Wasender key is configured server-side in
 `config/settings.py`; it is never sent to the browser. No `.env` file is needed
 for that key. SQLite is used when `DATABASE_URL` is empty.
 
@@ -24,8 +24,9 @@ for that key. SQLite is used when `DATABASE_URL` is empty.
 Sending is intentionally browser-driven. Start creates an immutable recipient
 snapshot but sends nothing. The browser asks Django to process one recipient per
 request. Django serializes claims in database transactions, makes one provider
-call, records the real response, and returns progress. In trial mode the browser
-waits through the visible 60-second countdown before requesting the next send.
+call, records the real response, and returns progress. The campaign's selected
+delay (0–3600 seconds) is enforced server-side; provider rate limits can still
+ask the browser to wait.
 
 If the page or tab closes, reopen the campaign and click **Resume** to continue
 from the first queued recipient. Already successful recipients are not requeued.

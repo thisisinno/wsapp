@@ -13,7 +13,7 @@
     <a href="{% url 'dashboard' %}">▦ Dashboard</a><a href="{% url 'uploads' %}">⇧ Uploads</a>
     <a href="{% url 'uploads' %}">♙ Recipients</a><a href="{% url 'campaigns' %}">✦ Campaigns</a>
     <a href="{% url 'message_logs' %}">≡ Message Logs</a><a href="{% url 'message_logs' %}?status=failed">! Failed Messages</a>
-    <a href="{% url 'campaigns' %}">◫ Templates</a><a href="#">⚙ Settings</a>
+    <a href="{% url 'campaigns' %}">◫ Templates</a><a href="{% url 'messaging_settings' %}">⚙ Settings</a>
   </nav>
 </aside>
 <header class="topbar"><button class="menu btn btn-sm" onclick="document.body.classList.toggle('nav-open')">☰</button><input aria-label="Search" placeholder="Search"><span class="ms-auto">○ Notifications</span><span>{{ user.username }}</span><form method="post" action="{% url 'logout' %}">{% csrf_token %}<button class="btn btn-sm btn-outline-secondary">Logout</button></form></header>

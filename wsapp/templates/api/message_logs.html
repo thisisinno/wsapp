@@ -59,12 +59,13 @@
 </form>
 
 <div class="card message-log-card">
+  <div id="messageBulkToolbar" class="app-table-selection d-none"><strong id="messageSelectedCount">0 selected</strong><button id="bulkRefresh" class="btn btn-sm btn-outline-primary">Refresh</button><button id="bulkDelete" class="btn btn-sm btn-outline-danger">Delete</button><button id="bulkResend" class="btn btn-sm btn-warning">Resend failures</button><button id="bulkClear" class="btn btn-sm btn-outline-secondary">Clear selection</button></div>
   <div id="refreshProgress" class="px-3 pt-3 text-muted d-none" role="status"></div>
   <div class="table-responsive">
     <table class="table align-middle message-table mb-0">
       <thead>
         <tr>
-          <th>S/N</th>
+          <th><input id="messageVisibleAll" type="checkbox" aria-label="Select visible messages"></th><th>S/N</th>
           <th>Phone number</th>
           <th>Message</th>
           <th>Status</th>
@@ -74,7 +75,7 @@
       <tbody id="messageRows">
         {% for entry, serial in rows %}
           <tr id="message-{{ entry.id }}" data-message-id="{{ entry.id }}" data-serial="{{ serial }}">
-            <td class="message-serial">{{ page_obj.start_index|add:forloop.counter0 }}</td>
+            <td><input class="message-check" type="checkbox" value="{{ entry.id }}" aria-label="Select message"></td><td class="message-serial">{{ page_obj.start_index|add:forloop.counter0 }}</td>
             <td>
               <span class="message-phone">{{ entry.normalized_phone }}</span>
               <button type="button" class="btn btn-sm btn-link copy-phone" data-phone="{{ entry.normalized_phone }}" aria-label="Copy phone">⧉</button>
@@ -105,7 +106,7 @@
             </td>
           </tr>
         {% empty %}
-          <tr><td colspan="5" class="empty py-5"><strong>No messages found.</strong><br><span class="text-muted">Send a campaign or adjust the filters.</span></td></tr>
+          <tr><td colspan="6" class="empty py-5"><strong>No messages found.</strong><br><span class="text-muted">Send a campaign or adjust the filters.</span></td></tr>
         {% endfor %}
       </tbody>
     </table>

@@ -2,13 +2,13 @@ import math
 import time
 from datetime import timedelta
 
-from django.conf import settings
 from django.db import transaction
 from django.db.models import Count
 from django.utils import timezone
 
 from api.models import CampaignRecipient, MessageAttempt
-from api.services.campaigns import recalculate_campaign
+from api.services.campaigns import campaign_interval_seconds, recalculate_campaign
+from api.services.media import ensure_media_ready
 from api.services.phones import normalize_tanzania_phone
 from api.services.wasender import (
     ACK_LEVELS,
@@ -163,13 +163,6 @@ def delete_message(entry, client=None):
     return entry
 
 
-def _interval_seconds():
-    return max(
-        60 if settings.WASENDER_TRIAL_MODE else 0,
-        settings.WASENDER_SEND_INTERVAL_SECONDS,
-    )
-
-
 def resend_message(entry_id, owner_id, data, client=None):
     text = _validate_text(data.get("text"))
     phone_result = normalize_tanzania_phone(data.get("phone"))
@@ -192,17 +185,19 @@ def resend_message(entry_id, owner_id, data, client=None):
         if entry.provider_deleted_at:
             raise MessageActionError("A deleted provider message cannot be resent.", status=409)
         latest = (
-            MessageAttempt.objects.filter(campaign_recipient__campaign__owner_id=owner_id)
-            .order_by("-created_at")
+            MessageAttempt.objects.filter(
+                campaign_recipient__campaign__owner_id=owner_id,
+                campaign_recipient__attempt_started_at__isnull=False,
+            ).order_by("-campaign_recipient__attempt_started_at")
             .first()
         )
         now = timezone.now()
         if latest:
-            next_allowed = latest.created_at + timedelta(seconds=_interval_seconds())
+            next_allowed = latest.campaign_recipient.attempt_started_at + timedelta(seconds=campaign_interval_seconds(entry.campaign))
             if next_allowed > now:
                 wait = max(1, math.ceil((next_allowed - now).total_seconds()))
                 raise MessageActionError(
-                    "The trial send interval is still active.",
+                    "The campaign send interval is still active.",
                     status=429,
                     data={"wait_seconds": wait},
                 )
@@ -222,7 +217,14 @@ def resend_message(entry_id, owner_id, data, client=None):
             if unchanged and entry.provider_message_id:
                 result = provider_client.resend_message(entry.provider_message_id)
             else:
-                result = provider_client.send_message(entry.normalized_phone, entry.rendered_message)
+                media_field = media_url = None
+                if entry.campaign.media_id:
+                    media = ensure_media_ready(entry.campaign.media)
+                    media_field = {"image": "imageUrl", "video": "videoUrl", "audio": "audioUrl", "document": "documentUrl"}.get(media.media_type)
+                    media_url = media.provider_public_url
+                    attempt.request_payload = {"to": entry.normalized_phone, "text": entry.rendered_message, "media_type": media.media_type, "media_url": media_url, "original_filename": media.original_filename}
+                    attempt.save(update_fields=["request_payload", "updated_at"])
+                result = provider_client.send_message(entry.normalized_phone, entry.rendered_message, media_field, media_url)
             provider_data = _provider_data(result)
             status_text = provider_data.get("status", "pending")
             normalized = normalize_message_status(

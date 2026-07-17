@@ -3,6 +3,7 @@ from pathlib import Path
 
 from django.conf import settings
 from django.core.validators import FileExtensionValidator
+from django.core.validators import MaxValueValidator
 from django.db import models
 
 
@@ -36,6 +37,13 @@ class UploadedDataset(UUIDTimeModel):
     processing_status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
     processing_error = models.TextField(blank=True)
     selected_phone_column = models.CharField(max_length=255, blank=True)
+    whatsapp_check_paused = models.BooleanField(default=False)
+
+
+class MessagingPreference(UUIDTimeModel):
+    owner = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="messaging_preference")
+    default_send_interval_seconds = models.PositiveIntegerField(default=1, validators=[MaxValueValidator(3600)])
+    auto_check_whatsapp_after_normalization = models.BooleanField(default=True)
 
 
 class SuppressedRecipient(UUIDTimeModel):
@@ -113,6 +121,7 @@ class Campaign(UUIDTimeModel):
     body_snapshot = models.TextField()
     selected_phone_column = models.CharField(max_length=255)
     selected_recipient_count = models.PositiveIntegerField(default=0)
+    send_interval_seconds = models.PositiveIntegerField(default=1, validators=[MaxValueValidator(3600)])
     media = models.ForeignKey(UploadedMedia, null=True, blank=True, on_delete=models.SET_NULL)
     status = models.CharField(max_length=30, choices=Status.choices, default=Status.DRAFT)
     missing_value_policy = models.CharField(max_length=20, default="empty")

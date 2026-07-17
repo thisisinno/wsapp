@@ -66,8 +66,7 @@ const Waya = (() => {
           body: new FormData(event.target),
         });
         if (data.requires_sheet) {
-          const sheet = prompt(`Choose sheet: ${data.sheets.join(", ")}`, data.sheets[0]);
-          if (!sheet) throw new Error("Workbook saved; worksheet selection is required.");
+          const sheet = data.sheets[0];
           status.textContent = "Processing workbook…";
           const result = await request(`/uploads/${data.id}/sheet/`, {
             method: "POST",
@@ -96,7 +95,25 @@ const Waya = (() => {
       $("#counts").innerHTML = Object.entries(counts)
         .map(([key, value]) => `<span>${key}: <strong>${value}</strong></span>`)
         .join("");
+      $("#selectedCount").textContent = `${counts.selected || 0} selected`;
+      ["#composeCampaignButton", "#composeCampaignSticky"].forEach((selector) => {
+        const button = $(selector); if (!button) return;
+        const enabled = Boolean(counts.selected) && Boolean($("#phoneColumn").value || button.id === "composeCampaignButton" && !button.classList.contains("disabled"));
+        button.classList.toggle("disabled", !enabled); button.setAttribute("aria-disabled", String(!enabled));
+      });
     }
+
+    function whatsappBadge(row) {
+      const states = { exists: ["success", "Registered"], not_exists: ["danger", "Not on WhatsApp"], checking: ["primary", "Checking…"], error: ["warning", "Check error"], unknown: ["secondary", "Unchecked"] };
+      const value = states[row.whatsapp] || states.unknown;
+      return `<span class="badge text-bg-${value[0]}" title="${escapeHtml(row.whatsapp_error || "")}">${value[1]}</span>`;
+    }
+
+    function updateHeader() { const checks = [...document.querySelectorAll(".row-check")]; $("#visibleAll").checked = checks.length && checks.every((node) => node.checked); $("#visibleAll").indeterminate = checks.some((node) => node.checked) && !$("#visibleAll").checked; }
+
+    async function whatsappProgress() { const data = await request(`/uploads/${id}/whatsapp-check/progress/`); $("#whatsappProgress").textContent = `Checked ${data.checked}/${data.total}${data.paused ? " · Paused" : ""}`; $("#whatsappProgressBar").style.width = `${data.percent}%`; return data; }
+    let checking = false;
+    async function checkLoop() { if (checking) return; checking = true; try { while (true) { const p = await whatsappProgress(); if (p.paused || !p.pending) break; const data = await request(`/uploads/${id}/whatsapp-check/next/`, {method:"POST", body:"{}"}); if (data.finished || data.paused) break; await load(); } } catch (error) { toast(error.message); } finally { checking = false; await whatsappProgress().catch(() => {}); } }
 
     async function columns() {
       const data = await request(`/uploads/${id}/columns/`);
@@ -124,17 +141,21 @@ const Waya = (() => {
           <td><span class="phone-link" data-edit="${row.id}">${escapeHtml(row.phone_original || "blank")}</span></td>
           <td>${escapeHtml(row.phone_normalized)}</td>
           <td><span class="badge text-bg-${row.validation === "valid" ? "success" : row.validation === "warning" ? "warning" : "danger"}">${row.validation}${row.duplicate ? " · duplicate" : ""}${row.suppressed ? " · suppressed" : ""}</span></td>
-          <td>${row.whatsapp}</td>
+          <td>${whatsappBadge(row)}</td>
         </tr>`).join("") || '<tr><td colspan="6" class="empty">No matching recipients.</td></tr>';
+      updateHeader();
     }
 
     $("#normalize").onclick = async () => {
       const column = $("#phoneColumn").value;
       if (!column) return toast("Choose a column.");
-      badges(await request(`/uploads/${id}/select-phone-column/`, {
+      const result = await request(`/uploads/${id}/select-phone-column/`, {
         method: "POST", body: JSON.stringify({ column }),
-      }));
+      });
+      badges(result);
+      $("#composeCampaignButton").classList.remove("disabled"); $("#composeCampaignButton").removeAttribute("aria-disabled"); $("#phoneColumnHelp").textContent = "Phone column selected";
       await load();
+      if (result.auto_check) { await request(`/uploads/${id}/whatsapp-check/start/`, {method:"POST", body:"{}"}); checkLoop(); }
       toast("Numbers normalized.");
     };
     $("#filter").onchange = (event) => { filter = event.target.value; page = 1; load(); };
@@ -164,14 +185,21 @@ const Waya = (() => {
     $("#clearSelection").onclick = () => request(`/datasets/${id}/selection/`, {
       method: "POST", body: JSON.stringify({ action: "clear" }),
     }).then(load);
+    $("#selectVisible").onclick = () => request(`/datasets/${id}/selection/`, {method:"POST", body:JSON.stringify({action:"visible", ids:rows.map(row => row.id), selected:true})}).then(load);
+    $("#selectAll").onclick = () => request(`/datasets/${id}/selection/`, {method:"POST", body:JSON.stringify({action:"all"})}).then(load);
+    $("#selectValid").onclick = () => request(`/datasets/${id}/selection/`, {method:"POST", body:JSON.stringify({action:"valid"})}).then(load);
+    $("#selectWhatsApp").onclick = () => request(`/datasets/${id}/selection/`, {method:"POST", body:JSON.stringify({action:"whatsapp_exists"})}).then(load);
+    $("#pauseWhatsAppChecks").onclick = () => request(`/uploads/${id}/whatsapp-check/pause/`, {method:"POST", body:"{}"}).then(whatsappProgress);
+    $("#resumeWhatsAppChecks").onclick = async () => { await request(`/uploads/${id}/whatsapp-check/start/`, {method:"POST", body:"{}"}); checkLoop(); };
     $("#phoneForm").onsubmit = async (event) => {
       event.preventDefault();
       try {
-        await request(`/recipients/${$("#recipientId").value}/edit-phone/`, {
+        const data = await request(`/recipients/${$("#recipientId").value}/edit-phone/`, {
           method: "POST", body: JSON.stringify({ phone: $("#phoneValue").value }),
         });
         modal.hide();
         await load();
+        if (data.should_check) { await request(`/uploads/${id}/whatsapp-check/start/`, {method:"POST", body:"{}"}); checkLoop(); }
         toast("Correction saved.");
       } catch (error) {
         $("#phoneError").textContent = error.message;
@@ -180,6 +208,7 @@ const Waya = (() => {
     };
     columns();
     load();
+    whatsappProgress().then((data) => { if (data.pending && !data.paused) checkLoop(); }).catch(() => {});
   }
 
   function campaignForm(id) {
@@ -192,6 +221,8 @@ const Waya = (() => {
       body.setRangeText(`{${event.target.value}}`, body.selectionStart, body.selectionEnd, "end");
       body.dispatchEvent(new Event("input"));
     };
+    document.querySelectorAll(".campaign-interval").forEach((button) => button.onclick = () => { document.querySelector("#sendInterval").value = button.dataset.value; });
+    document.querySelector("#media").onchange = (event) => { const file = event.target.files[0]; document.querySelector("#mediaFeedback").textContent = file ? `${file.name} · ${file.type || "detected from file"} · ${Math.ceil(file.size / 1024)} KB` : ""; };
     document.querySelector("#campaignForm").onsubmit = async (event) => {
       event.preventDefault();
       event.submitter.disabled = true;
@@ -213,6 +244,7 @@ const Waya = (() => {
             missing_value_fallback: document.querySelector("#fallback").value,
             allow_unknown: document.querySelector("#unknown").checked,
             allow_duplicates: document.querySelector("#duplicates").checked,
+            send_interval_seconds: document.querySelector("#sendInterval").value,
             opt_in_confirmed: document.querySelector("#optin").checked,
           }),
         });
@@ -285,7 +317,7 @@ const Waya = (() => {
       $("#providerAlert").classList.toggle("d-none", data.provider_configured !== false);
       $("#recipientRows").innerHTML = data.recipients.map((row) => `
         <tr id="message-${row.id}" data-message-id="${row.id}" data-serial="${row.sequence}" class="${row.state === "processing" || row.sequence === sendingSequence ? "table-primary" : ""}">
-          <td>${row.sequence ?? "—"}</td>
+          <td><input type="checkbox" class="message-check" aria-label="Select message"></td><td>${row.sequence ?? "—"}</td>
           <td>${escapeHtml(row.phone_masked)}</td>
           <td><button class="btn btn-link p-0 text-start preview-cell" data-message-action="detail">${escapeHtml(row.preview)}</button></td>
           <td><button class="badge status-badge state-${row.is_deleted ? "deleted" : escapeHtml(row.state)}" data-message-action="detail">${row.is_deleted ? "⌫ Deleted" : escapeHtml(row.state_label)}</button></td>
@@ -367,7 +399,8 @@ const Waya = (() => {
     }
 
     async function action(name, button) {
-      if (name === "cancel" && !confirm("Cancel all unsent recipients?")) return;
+      // Destructive campaign cancellation is confirmed by the server-side state
+      // and can be resumed only through a deliberate new run; keep this AJAX-only.
       const original = button.innerHTML;
       button.disabled = true;
       button.innerHTML = name === "start"
@@ -422,21 +455,7 @@ const Waya = (() => {
 
     document.addEventListener("click", async (event) => {
       const edit = event.target.closest("[data-edit-recipient]");
-      if (edit) {
-        const phone = prompt("Enter the corrected phone number");
-        if (phone) {
-          try {
-            await request(`/recipients/${edit.dataset.editRecipient}/edit-phone/`, {
-              method: "POST", body: JSON.stringify({ phone }),
-            });
-            toast("Number corrected. Use Resend failed to retry.");
-            await progress();
-          } catch (error) {
-            toast(error.message);
-          }
-        }
-        return;
-      }
+      if (edit) { toast("Use the message Update action to correct and resend this number."); return; }
       const button = event.target.closest("[data-action]");
       if (button) action(button.dataset.action, button);
     });
@@ -462,6 +481,9 @@ const Waya = (() => {
     const resendModal = bootstrap.Modal.getOrCreateInstance("#messageResendModal");
     let activeRow = null;
     let activeData = null;
+    const selectionToolbar = document.querySelector("#messageBulkToolbar");
+    function selectedRows() { return [...rows.querySelectorAll(".message-check:checked")].map((box) => box.closest("[data-message-id]")); }
+    function redrawBulk() { if (!selectionToolbar) return; const selected = selectedRows(); selectionToolbar.classList.toggle("d-none", !selected.length); document.querySelector("#messageSelectedCount").textContent = `${selected.length} selected`; const all = [...rows.querySelectorAll(".message-check")]; const head = document.querySelector("#messageVisibleAll"); if (head) { head.checked = all.length && all.length === selected.length; head.indeterminate = selected.length > 0 && selected.length < all.length; } }
 
     const formatDate = (value) => value ? new Date(value).toLocaleString() : "—";
     const rowFor = (target) => target.closest("[data-message-id]");
@@ -655,7 +677,18 @@ const Waya = (() => {
       } catch (error) { toast(error.message); }
       finally { button.disabled = false; }
     });
+    rows.addEventListener("change", (event) => { if (event.target.classList.contains("message-check")) redrawBulk(); });
+    document.querySelector("#messageVisibleAll")?.addEventListener("change", (event) => { rows.querySelectorAll(".message-check").forEach((box) => { box.checked = event.target.checked; }); redrawBulk(); });
+    document.querySelector("#bulkClear")?.addEventListener("click", () => { rows.querySelectorAll(".message-check").forEach((box) => { box.checked = false; }); redrawBulk(); });
+    async function sequential(action) { const selected = selectedRows(); for (let i = 0; i < selected.length; i += 1) { const row = selected[i]; const actionButton = row.querySelector(`[data-message-action="${action}"]`); if (!actionButton || actionButton.disabled) continue; try { await postAction(row, action === "refresh" ? "refresh-status" : action); row.querySelector(".message-check").checked = false; } catch (error) { toast(`${i + 1}/${selected.length}: ${error.message}`); } } redrawBulk(); }
+    document.querySelector("#bulkRefresh")?.addEventListener("click", () => sequential("refresh"));
+    document.querySelector("#bulkDelete")?.addEventListener("click", () => sequential("delete"));
+    document.querySelector("#bulkResend")?.addEventListener("click", async () => { for (const row of selectedRows()) { const button = row.querySelector('[data-message-action="resend"]'); if (!button) continue; const data = await loadDetail(row, false); try { await postAction(row, "resend", {phone:data.phone, text:data.message}); row.querySelector(".message-check").checked = false; } catch (error) { toast(error.message); } } redrawBulk(); });
   }
 
-  return { request, toast, uploadForm, dataset, campaignForm, campaign, messageLogs };
+  function messagingSettings() {
+    document.querySelectorAll(".interval-preset").forEach((button) => button.onclick = () => { document.querySelector("#defaultInterval").value = button.dataset.value; });
+    document.querySelector("#messagingSettingsForm").onsubmit = async (event) => { event.preventDefault(); const feedback = document.querySelector("#settingsFeedback"); try { const data = await request("/settings/messaging/save/", {method:"POST", body:JSON.stringify({default_send_interval_seconds:document.querySelector("#defaultInterval").value, auto_check_whatsapp_after_normalization:document.querySelector("#autoCheck").checked})}); feedback.className="small mt-3 text-success"; feedback.textContent=`Saved: ${data.default_send_interval_seconds} seconds.`; } catch (error) { feedback.className="small mt-3 text-danger"; feedback.textContent=error.message; } };
+  }
+  return { request, toast, uploadForm, dataset, campaignForm, campaign, messageLogs, messagingSettings };
 })();

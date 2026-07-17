@@ -82,7 +82,6 @@ class PhoneImportTemplateTests(TestCase):
 
 @override_settings(
     WASENDER_API_KEY="test-key-never-used",
-    WASENDER_TRIAL_MODE=False,
     WASENDER_SEND_INTERVAL_SECONDS=0,
 )
 class CampaignSequentialTests(TestCase):
@@ -109,6 +108,7 @@ class CampaignSequentialTests(TestCase):
             selected_phone_column="phone",
             opt_in_confirmed=True,
             allow_unknown=True,
+            send_interval_seconds=0,
             status=Campaign.Status.READY,
         )
         self.client.force_login(self.user)
@@ -157,10 +157,11 @@ class CampaignSequentialTests(TestCase):
         self.assertEqual(send.call_count, 1)
         self.assertEqual(MessageAttempt.objects.count(), 1)
 
-    @override_settings(WASENDER_TRIAL_MODE=True, WASENDER_SEND_INTERVAL_SECONDS=0)
     @patch("api.services.campaigns.WasenderClient.check_number")
     @patch("api.services.campaigns.WasenderClient.send_message")
-    def test_trial_window_prevents_immediate_second_provider_call(self, send, check):
+    def test_campaign_interval_prevents_immediate_second_provider_call(self, send, check):
+        self.campaign.send_interval_seconds = 60
+        self.campaign.save()
         check.return_value = ProviderResult({"data": {"exists": True}}, 200)
         send.return_value = ProviderResult({"success": True, "data": {"msgId": "m"}}, 200)
         token = self.start().json()["data"]["run_token"]
@@ -443,7 +444,6 @@ class CsrfAndFrontendTests(TestCase):
 
 @override_settings(
     WASENDER_API_KEY="test-key-never-used",
-    WASENDER_TRIAL_MODE=False,
     WASENDER_SEND_INTERVAL_SECONDS=0,
 )
 class MessageLogTests(TestCase):
@@ -467,6 +467,7 @@ class MessageLogTests(TestCase):
             name="Owner campaign",
             body_snapshot="Hello",
             selected_phone_column="phone",
+            send_interval_seconds=0,
         )
         self.entry = CampaignRecipient.objects.create(
             campaign=self.campaign,
@@ -664,9 +665,12 @@ class MessageLogTests(TestCase):
         self.assertEqual(self.entry.rendered_message, "Corrected body")
         self.assertEqual(attempt.error_message, "Invalid corrected destination")
 
-    @override_settings(WASENDER_TRIAL_MODE=True, WASENDER_SEND_INTERVAL_SECONDS=0)
     @patch("api.services.message_logs.WasenderClient.resend_message")
-    def test_trial_interval_makes_no_provider_call(self, resend):
+    def test_campaign_interval_makes_no_provider_call(self, resend):
+        self.campaign.send_interval_seconds = 60
+        self.campaign.save()
+        self.entry.attempt_started_at = timezone.now()
+        self.entry.save()
         MessageAttempt.objects.create(
             campaign_recipient=self.entry,
             attempt_number=1,

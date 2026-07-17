@@ -1,5 +1,6 @@
 from datetime import timedelta
 
+from django.db import transaction
 from django.utils import timezone
 
 from api.models import UploadedMedia
@@ -31,12 +32,14 @@ def upload_media(media_id):
 
 
 def ensure_media_ready(media):
-    if (
-        not media.provider_public_url
-        or not media.provider_url_expires_at
-        or media.provider_url_expires_at <= timezone.now()
-    ):
-        media = upload_media(media.id)
+    with transaction.atomic():
+        media = UploadedMedia.objects.select_for_update().get(pk=media.pk)
+        if (
+            not media.provider_public_url
+            or not media.provider_url_expires_at
+            or media.provider_url_expires_at <= timezone.now()
+        ):
+            media = upload_media(media.id)
     if media.upload_status != UploadedMedia.Status.READY:
         raise WasenderError(f"Media upload unavailable: {media.upload_error}")
     return media
