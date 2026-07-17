@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}Message Logs · Waya{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Sent Messages</h1>
+    <p class="text-muted mb-0">Inspect delivery acknowledgements and safely manage your WhatsApp messages.</p>
+  </div>
+  <button id="refreshVisible" class="btn btn-outline-primary" {% if not rows %}disabled{% endif %}>
+    ↻ Refresh visible statuses
+  </button>
+</div>
+
+<form class="card p-3 mb-4 message-filters" method="get">
+  <div class="row g-2 align-items-end">
+    <div class="col-md-3">
+      <label class="form-label" for="campaignFilter">Campaign</label>
+      <select class="form-select" id="campaignFilter" name="campaign">
+        <option value="">All campaigns</option>
+        {% for campaign in campaigns %}
+          <option value="{{ campaign.id }}" {% if filters.campaign == campaign.id|stringformat:"s" %}selected{% endif %}>{{ campaign.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-md-2">
+      <label class="form-label" for="statusFilter">Status</label>
+      <select class="form-select" id="statusFilter" name="status">
+        <option value="">All statuses</option>
+        {% for value, label in status_options %}
+          <option value="{{ value }}" {% if filters.status == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+        <option value="pending" {% if filters.status == "pending" %}selected{% endif %}>Pending</option>
+        <option value="sent" {% if filters.status == "sent" %}selected{% endif %}>Sent</option>
+        <option value="delivered" {% if filters.status == "delivered" %}selected{% endif %}>Delivered</option>
+        <option value="read" {% if filters.status == "read" %}selected{% endif %}>Read</option>
+        <option value="played" {% if filters.status == "played" %}selected{% endif %}>Played</option>
+        <option value="failed" {% if filters.status == "failed" %}selected{% endif %}>Failed</option>
+        <option value="deleted" {% if filters.status == "deleted" %}selected{% endif %}>Deleted</option>
+        <option value="unknown" {% if filters.status == "unknown" %}selected{% endif %}>Unknown</option>
+      </select>
+    </div>
+    <div class="col-md-2">
+      <label class="form-label" for="deliveredFilter">Delivery</label>
+      <select class="form-select" id="deliveredFilter" name="delivered">
+        <option value="">Any</option>
+        <option value="yes" {% if filters.delivered == "yes" %}selected{% endif %}>Delivered</option>
+        <option value="no" {% if filters.delivered == "no" %}selected{% endif %}>Not delivered</option>
+      </select>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label" for="phoneFilter">Phone number</label>
+      <input class="form-control" id="phoneFilter" name="phone" value="{{ filters.phone|default:'' }}" placeholder="+255…">
+    </div>
+    <div class="col-md-2 d-flex gap-2">
+      <button class="btn btn-purple flex-grow-1">Filter</button>
+      <a class="btn btn-outline-secondary" href="{% url 'message_logs' %}" aria-label="Clear filters">×</a>
+    </div>
+  </div>
+</form>
+
+<div class="card message-log-card">
+  <div id="refreshProgress" class="px-3 pt-3 text-muted d-none" role="status"></div>
+  <div class="table-responsive">
+    <table class="table align-middle message-table mb-0">
+      <thead>
+        <tr>
+          <th>S/N</th>
+          <th>Phone number</th>
+          <th>Message</th>
+          <th>Status</th>
+          <th class="text-end">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="messageRows">
+        {% for entry, serial in rows %}
+          <tr id="message-{{ entry.id }}" data-message-id="{{ entry.id }}" data-serial="{{ serial }}">
+            <td class="message-serial">{{ page_obj.start_index|add:forloop.counter0 }}</td>
+            <td>
+              <span class="message-phone">{{ entry.normalized_phone }}</span>
+              <button type="button" class="btn btn-sm btn-link copy-phone" data-phone="{{ entry.normalized_phone }}" aria-label="Copy phone">⧉</button>
+            </td>
+            <td>
+              <button type="button" class="btn btn-link p-0 text-start message-preview" data-message-action="detail">
+                {{ entry.rendered_message|truncatechars:90 }}
+              </button>
+            </td>
+            <td>
+              {% if entry.provider_deleted_at %}
+                <button class="badge status-badge state-deleted" data-message-action="detail">⌫ Deleted</button>
+              {% else %}
+                <button class="badge status-badge state-{{ entry.state }}" data-message-action="detail">{{ entry.get_state_display }}</button>
+              {% endif %}
+              <small class="d-block text-muted delivery-note">
+                {% if entry.state == "delivered" or entry.state == "read" or entry.state == "played" %}Delivered{% else %}Not delivered yet{% endif %}
+              </small>
+            </td>
+            <td class="text-end message-actions">
+              <button class="btn btn-sm btn-outline-secondary" data-message-action="detail">View</button>
+              <button class="btn btn-sm btn-outline-primary" data-message-action="refresh" {% if not entry.provider_message_id or entry.provider_deleted_at %}disabled title="No active provider message ID"{% endif %}>↻</button>
+              <button class="btn btn-sm btn-outline-secondary" data-message-action="update" {% if entry.provider_deleted_at or not entry.provider_message_id and entry.state != "failed" %}disabled{% endif %}>Update</button>
+              <button class="btn btn-sm btn-outline-danger" data-message-action="delete" {% if not entry.provider_message_id or entry.provider_deleted_at %}disabled{% endif %}>Delete</button>
+              {% if entry.state == "failed" and not entry.provider_deleted_at %}
+                <button class="btn btn-sm btn-warning" data-message-action="resend">Resend</button>
+              {% endif %}
+            </td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="5" class="empty py-5"><strong>No messages found.</strong><br><span class="text-muted">Send a campaign or adjust the filters.</span></td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% if page_obj.paginator.num_pages > 1 %}
+<nav class="mt-4" aria-label="Message pages">
+  <ul class="pagination justify-content-center">
+    {% if page_obj.has_previous %}<li class="page-item"><a class="page-link" href="?{{ pagination_query }}page={{ page_obj.previous_page_number }}">Previous</a></li>{% endif %}
+    <li class="page-item disabled"><span class="page-link">Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}</span></li>
+    {% if page_obj.has_next %}<li class="page-item"><a class="page-link" href="?{{ pagination_query }}page={{ page_obj.next_page_number }}">Next</a></li>{% endif %}
+  </ul>
+</nav>
+{% endif %}
+
+{% include "api/message_modals.html" %}
+{% endblock %}
+{% block scripts %}
+<script>Waya.messageLogs();</script>
+{% endblock %}

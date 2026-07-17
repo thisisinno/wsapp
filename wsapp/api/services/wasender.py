@@ -31,6 +31,84 @@ def _safe_message(value):
     return message.replace(secret, "[redacted]") if secret else message
 
 
+def safe_provider_payload(payload):
+    """Return useful provider diagnostics with credentials recursively removed."""
+    secret = str(settings.WASENDER_API_KEY or "")
+    secret_keys = {"authorization", "api_key", "apikey", "token", "access_token"}
+
+    def clean(value):
+        if isinstance(value, dict):
+            return {
+                str(key): clean(item)
+                for key, item in value.items()
+                if str(key).lower() not in secret_keys
+            }
+        if isinstance(value, list):
+            return [clean(item) for item in value]
+        if isinstance(value, str):
+            return value.replace(secret, "[redacted]") if secret else value
+        return value
+
+    return clean(payload if isinstance(payload, (dict, list)) else {})
+
+
+def safe_provider_text(value):
+    return safe_provider_payload({"message": str(value)}).get("message", "")
+
+
+ACK_LEVELS = {
+    "unknown": -1,
+    "failed": 0,
+    "pending": 1,
+    "sent": 2,
+    "delivered": 3,
+    "read": 4,
+    "played": 5,
+}
+
+
+def normalize_message_status(code=None, text=None):
+    """Map provider acknowledgements conservatively to a recipient state."""
+    numeric = None
+    try:
+        numeric = int(code)
+    except (TypeError, ValueError):
+        pass
+    by_code = {
+        0: "failed",
+        1: "pending",
+        2: "sent",
+        3: "delivered",
+        4: "read",
+        5: "played",
+    }
+    if numeric in by_code:
+        return by_code[numeric]
+    try:
+        text_code = int(text)
+    except (TypeError, ValueError):
+        text_code = None
+    if text_code in by_code:
+        return by_code[text_code]
+    normalized = str(text or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "in_progress": "pending",
+        "processing": "pending",
+        "accepted": "pending",
+        "queued": "pending",
+        "pending": "pending",
+        "sent": "sent",
+        "server_acknowledged": "sent",
+        "delivered": "delivered",
+        "read": "read",
+        "played": "played",
+        "failed": "failed",
+        "failure": "failed",
+        "error": "failed",
+    }
+    return aliases.get(normalized, "unknown")
+
+
 class WasenderClient:
     def __init__(self, api_key=None, base_url=None, session=None):
         self.api_key = settings.WASENDER_API_KEY if api_key is None else api_key
@@ -79,7 +157,21 @@ class WasenderClient:
     def check_number(self, phone): return self._request("GET", f"/api/on-whatsapp/{phone}")
     def upload_media(self, fileobj, mime):
         return self._request("POST", "/api/upload", headers={"Content-Type": mime}, data=fileobj)
-    def edit_message(self, message_id, text): return self._request("PUT", f"/api/messages/{message_id}", json={"text": text})
-    def message_info(self, message_id): return self._request("GET", f"/api/messages/{message_id}/info")
-    def delete_message(self, message_id): return self._request("DELETE", f"/api/messages/{message_id}")
-    def resend_message(self, message_id): return self._request("POST", f"/api/messages/{message_id}/resend")
+    def _successful_action(self, method, path, **kwargs):
+        result = self._request(method, path, **kwargs)
+        if result.data.get("success") is not True:
+            message = result.data.get("message") or result.data.get("error") or "Provider rejected the action."
+            raise WasenderError(_safe_message(message), result.http_status, result.data)
+        return result
+
+    def edit_message(self, message_id, text):
+        return self._successful_action("PUT", f"/api/messages/{message_id}", json={"text": text})
+
+    def message_info(self, message_id):
+        return self._successful_action("GET", f"/api/messages/{message_id}/info")
+
+    def delete_message(self, message_id):
+        return self._successful_action("DELETE", f"/api/messages/{message_id}")
+
+    def resend_message(self, message_id):
+        return self._successful_action("POST", f"/api/messages/{message_id}/resend")

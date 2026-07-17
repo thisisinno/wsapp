@@ -1,0 +1,43 @@
+<div class="modal fade" id="messageDetailModal" tabindex="-1" aria-labelledby="messageDetailTitle" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable"><div class="modal-content">
+    <div class="modal-header"><h2 class="modal-title h5" id="messageDetailTitle">Message details</h2><button class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+    <div class="modal-body" id="messageDetailBody"><div class="message-skeleton"></div></div>
+  </div></div>
+</div>
+
+<div class="modal fade" id="messageUpdateModal" tabindex="-1" aria-labelledby="messageUpdateTitle" aria-hidden="true">
+  <div class="modal-dialog"><form class="modal-content" id="messageUpdateForm">
+    <div class="modal-header"><h2 class="modal-title h5" id="messageUpdateTitle">Update message</h2><button class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+    <div class="modal-body">
+      <input type="hidden" name="id">
+      <div class="mb-3 local-phone-field"><label class="form-label">Phone</label><input class="form-control" name="phone"></div>
+      <div class="mb-3"><label class="form-label">Message</label><textarea class="form-control" name="text" rows="7" maxlength="4096" required></textarea></div>
+      <div class="form-check local-phone-field"><input class="form-check-input" type="checkbox" name="update_imported_recipient" id="updateImported"><label class="form-check-label" for="updateImported">Also update the imported Excel row</label></div>
+      <div class="text-danger mt-2 form-error" role="alert"></div>
+    </div>
+    <div class="modal-footer"><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button class="btn btn-purple">Save correction</button></div>
+  </form></div>
+</div>
+
+<div class="modal fade" id="messageDeleteModal" tabindex="-1" aria-labelledby="messageDeleteTitle" aria-hidden="true">
+  <div class="modal-dialog"><div class="modal-content">
+    <div class="modal-header"><h2 class="modal-title h5" id="messageDeleteTitle">Delete from WhatsApp?</h2><button class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+    <div class="modal-body">This removes the provider message but preserves your campaign audit history.</div>
+    <div class="modal-footer"><button class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button id="confirmMessageDelete" class="btn btn-danger">Delete from WhatsApp</button></div>
+  </div></div>
+</div>
+
+<div class="modal fade" id="messageResendModal" tabindex="-1" aria-labelledby="messageResendTitle" aria-hidden="true">
+  <div class="modal-dialog modal-lg"><form class="modal-content" id="messageResendForm">
+    <div class="modal-header"><h2 class="modal-title h5" id="messageResendTitle">Correct and resend</h2><button class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+    <div class="modal-body">
+      <input type="hidden" name="id">
+      <div class="alert alert-danger previous-failure"></div>
+      <div class="mb-3"><label class="form-label">Phone</label><input class="form-control" name="phone" required></div>
+      <div class="mb-3"><label class="form-label">Message</label><textarea class="form-control" name="text" rows="7" maxlength="4096" required></textarea></div>
+      <div class="text-danger form-error" role="alert"></div>
+      <div class="text-muted resend-countdown" role="status"></div>
+    </div>
+    <div class="modal-footer"><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button class="btn btn-warning">Save and resend</button></div>
+  </form></div>
+</div>

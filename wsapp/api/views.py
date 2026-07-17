@@ -7,6 +7,7 @@ from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import UploadedFile
+from django.core.paginator import Paginator
 from django.db import models, transaction
 from django.db.models import Count, Q
 from django.http import Http404, HttpResponse, JsonResponse
@@ -33,6 +34,18 @@ from .services.media import upload_media
 from .services.phones import normalize_tanzania_phone
 from .services.templates import TemplateError, render_message, validate_template
 from .services.wasender import WasenderClient, WasenderError
+from .services.wasender import safe_provider_payload
+from .services.message_logs import (
+    DELIVERED_STATES,
+    MessageActionError,
+    campaign_counts,
+    delete_message as delete_logged_message,
+    message_queryset,
+    refresh_status as refresh_message_status_service,
+    resend_message as resend_logged_message,
+    serialize_row,
+    update_message as update_logged_message,
+)
 
 
 def ok(data=None, message=""):
@@ -394,7 +407,9 @@ def mask_phone(phone):
 
 
 def campaign_progress_data(campaign):
-    recipients = campaign.campaign_recipients.select_related("imported_recipient")
+    recipients = campaign.campaign_recipients.select_related(
+        "imported_recipient"
+    ).annotate(attempt_count=Count("attempts", distinct=True))
     states = dict(recipients.values("state").annotate(n=Count("id")).values_list("state", "n"))
     total = sum(states.values())
     sendable_total = sum(states.get(state, 0) for state in SENDABLE_STATES)
@@ -411,9 +426,12 @@ def campaign_progress_data(campaign):
     )).order_by("priority", "sequence_number", "-updated_at")[:100]
     rows = [{
         "id": str(r.id), "recipient_id": str(r.imported_recipient_id), "sequence": r.sequence_number,
-        "phone_masked": mask_phone(r.normalized_phone), "preview": r.rendered_message[:160],
+        "phone_masked": mask_phone(r.normalized_phone),
+        "preview": r.rendered_message[:160],
         "state": r.state, "state_label": r.get_state_display(), "error": r.skip_reason,
-        "attempts": r.attempts.count(), "updated_at": r.updated_at.isoformat(),
+        "attempts": r.attempt_count, "updated_at": r.updated_at.isoformat(),
+        "provider_message_id": r.provider_message_id,
+        "is_deleted": bool(r.provider_deleted_at),
     } for r in order]
     accepted = states.get("accepted", 0) + states.get("pending", 0)
     latest_attempt = recipients.filter(attempt_started_at__isnull=False).order_by(
@@ -468,26 +486,199 @@ def campaign_progress(request, campaign_id):
     return response
 
 
+def _action_error(exc):
+    return error(
+        str(exc),
+        fields=exc.fields,
+        status=exc.status,
+        data=exc.data,
+    )
+
+
+def _action_data(entry, serial_number=None):
+    return {
+        "row": serialize_row(entry, serial_number),
+        "campaign_counts": campaign_counts(entry.campaign),
+    }
+
+
+@login_required
+@ensure_csrf_cookie
+@require_GET
+def message_logs(request):
+    queryset = message_queryset(request.user)
+    campaign_id = request.GET.get("campaign", "")
+    status = request.GET.get("status", "")
+    delivered = request.GET.get("delivered", "")
+    phone = request.GET.get("phone", "").strip()
+    if campaign_id:
+        queryset = queryset.filter(campaign_id=campaign_id)
+    if status:
+        if status == "deleted":
+            queryset = queryset.filter(provider_deleted_at__isnull=False)
+        elif status == "unknown":
+            known = [choice.value for choice in CampaignRecipient.State]
+            queryset = queryset.exclude(state__in=known)
+        elif status == "pending":
+            queryset = queryset.filter(
+                state__in=["queued", "processing", "accepted", "pending"],
+                provider_deleted_at__isnull=True,
+            )
+        else:
+            queryset = queryset.filter(state=status, provider_deleted_at__isnull=True)
+    if delivered == "yes":
+        queryset = queryset.filter(state__in=DELIVERED_STATES)
+    elif delivered == "no":
+        queryset = queryset.exclude(state__in=DELIVERED_STATES)
+    if phone:
+        queryset = queryset.filter(normalized_phone__icontains=phone)
+    queryset = queryset.order_by("-updated_at", "-created_at")
+    paginator = Paginator(queryset, 25)
+    page_obj = paginator.get_page(request.GET.get("page", 1))
+    start_index = page_obj.start_index() if paginator.count else 0
+    rows = [
+        (entry, start_index + offset)
+        for offset, entry in enumerate(page_obj.object_list)
+    ]
+    context = {
+        "rows": rows,
+        "page_obj": page_obj,
+        "campaigns": request.user.campaigns.order_by("name"),
+        "filters": request.GET,
+        "pagination_query": "".join(
+            f"{key}={value}&"
+            for key, value in request.GET.items()
+            if key != "page"
+        ),
+    }
+    return render(request, "api/message_logs.html", context)
+
+
+@login_required
+@require_GET
+def message_detail(request, entry_id):
+    entry = get_object_or_404(
+        message_queryset(request.user), pk=entry_id
+    )
+    attempts = []
+    for attempt in entry.attempts.order_by("-created_at"):
+        attempts.append({
+            "attempt_number": attempt.attempt_number,
+            "http_status": attempt.http_status,
+            "error_category": attempt.error_category,
+            "error_message": attempt.error_message,
+            "duration_ms": attempt.duration_ms,
+            "attempted_at": attempt.created_at.isoformat(),
+            "provider_response": safe_provider_payload(attempt.provider_response),
+            "provider_message_id": attempt.provider_message_id,
+        })
+    data = serialize_row(entry, request.GET.get("serial") or None)
+    data.update({
+        "original_row_number": entry.imported_recipient.original_row_number,
+        "attempts": attempts,
+    })
+    return ok(data)
+
+
 @login_required
 @require_POST
-def message_action(request, entry_id, action):
-    entry = get_object_or_404(CampaignRecipient, pk=entry_id, campaign__owner=request.user)
-    data = json_body(request)
-    if not entry.provider_message_id: return error("The provider has not assigned a message ID.")
+def message_refresh_status(request, entry_id):
+    entry = get_object_or_404(
+        CampaignRecipient,
+        pk=entry_id,
+        campaign__owner=request.user,
+    )
     try:
-        client = WasenderClient()
-        if action == "edit":
-            text = data.get("text", "").strip()
-            if not text: return error("Message text is required.", {"text": ["Required."]})
-            result = client.edit_message(entry.provider_message_id, text); entry.rendered_message = text
-        elif action == "delete":
-            result = client.delete_message(entry.provider_message_id); entry.state = "cancelled"
-        elif action == "resend":
-            result = client.resend_message(entry.provider_message_id); entry.state = "accepted"; entry.retry_count += 1
-        entry.last_provider_payload = result.data; entry.save()
-        return ok({"state": entry.state}, "Provider accepted the action.")
-    except WasenderError as exc:
-        return error(str(exc), status=exc.status if exc.status and exc.status < 500 else 502)
+        entry = refresh_message_status_service(entry)
+    except MessageActionError as exc:
+        return _action_error(exc)
+    return ok(
+        _action_data(entry, json_body(request).get("serial_number")),
+        "Message status refreshed.",
+    )
+
+
+@login_required
+@require_POST
+def message_update(request, entry_id):
+    data = json_body(request)
+    try:
+        with transaction.atomic():
+            entry = get_object_or_404(
+                CampaignRecipient.objects.select_for_update().select_related(
+                    "campaign", "imported_recipient"
+                ),
+                pk=entry_id,
+                campaign__owner=request.user,
+            )
+            entry = update_logged_message(entry, data)
+    except MessageActionError as exc:
+        return _action_error(exc)
+    return ok(_action_data(entry, data.get("serial_number")), "Message updated.")
+
+
+@login_required
+@require_POST
+def message_delete(request, entry_id):
+    data = json_body(request)
+    try:
+        with transaction.atomic():
+            entry = get_object_or_404(
+                CampaignRecipient.objects.select_for_update().select_related("campaign"),
+                pk=entry_id,
+                campaign__owner=request.user,
+            )
+            entry = delete_logged_message(entry)
+    except MessageActionError as exc:
+        return _action_error(exc)
+    return ok(_action_data(entry, data.get("serial_number")), "Message deleted from WhatsApp.")
+
+
+@login_required
+@require_POST
+def message_resend(request, entry_id):
+    data = json_body(request)
+    get_object_or_404(
+        CampaignRecipient, pk=entry_id, campaign__owner=request.user
+    )
+    try:
+        entry = resend_logged_message(entry_id, request.user.id, data)
+    except MessageActionError as exc:
+        return _action_error(exc)
+    return ok(_action_data(entry, data.get("serial_number")), "Message resent.")
+
+
+@login_required
+@require_POST
+def refresh_visible_statuses(request):
+    data = json_body(request)
+    ids = data.get("ids", [])
+    if not isinstance(ids, list) or len(ids) > 25:
+        return error("Provide at most 25 visible message IDs.", {"ids": ["Maximum 25."]})
+    owned = {
+        str(entry.id): entry
+        for entry in CampaignRecipient.objects.filter(
+            id__in=ids, campaign__owner=request.user
+        ).select_related("campaign")
+    }
+    results = []
+    serials = data.get("serial_numbers", {})
+    for entry_id in ids:
+        entry = owned.get(str(entry_id))
+        if not entry:
+            results.append({"id": str(entry_id), "ok": False, "message": "Message not found."})
+            continue
+        try:
+            entry = refresh_message_status_service(entry)
+            results.append({
+                "id": str(entry.id),
+                "ok": True,
+                "row": serialize_row(entry, serials.get(str(entry.id))),
+                "campaign_counts": campaign_counts(entry.campaign),
+            })
+        except MessageActionError as exc:
+            results.append({"id": str(entry.id), "ok": False, "message": str(exc)})
+    return ok({"results": results}, f"{sum(item['ok'] for item in results)}/{len(results)} refreshed.")
 
 
 @login_required

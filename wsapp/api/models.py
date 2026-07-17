@@ -159,6 +159,10 @@ class CampaignRecipient(UUIDTimeModel):
     delivered_at = models.DateTimeField(null=True, blank=True)
     read_at = models.DateTimeField(null=True, blank=True)
     failed_at = models.DateTimeField(null=True, blank=True)
+    provider_status_checked_at = models.DateTimeField(null=True, blank=True)
+    provider_edited_at = models.DateTimeField(null=True, blank=True)
+    provider_deleted_at = models.DateTimeField(null=True, blank=True)
+    provider_action_error = models.TextField(blank=True, default="")
     retry_count = models.PositiveIntegerField(default=0)
     sequence_number = models.PositiveIntegerField(null=True, blank=True)
     scheduled_for = models.DateTimeField(null=True, blank=True)
@@ -166,6 +170,10 @@ class CampaignRecipient(UUIDTimeModel):
     attempt_finished_at = models.DateTimeField(null=True, blank=True)
     class Meta:
         constraints = [models.UniqueConstraint(fields=["campaign", "imported_recipient"], name="unique_campaign_recipient")]
+        indexes = [
+            models.Index(fields=["campaign", "state"], name="api_msg_campaign_state"),
+            models.Index(fields=["provider_message_id"], name="api_msg_provider_id"),
+        ]
 
 
 class MessageAttempt(UUIDTimeModel):

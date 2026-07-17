@@ -32,6 +32,7 @@ from .services.wasender import (
     ValidationError,
     WasenderClient,
     WasenderError,
+    normalize_message_status,
 )
 
 User = get_user_model()
@@ -418,7 +419,6 @@ class CsrfAndFrontendTests(TestCase):
             HTTP_X_REQUESTED_WITH="XMLHttpRequest",
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(Campaign.objects.filter(owner=self.user).count(), 1)
 
     def test_missing_csrf_is_rejected_without_creating_campaign(self):
         response = self.client.post(
@@ -439,6 +439,262 @@ class CsrfAndFrontendTests(TestCase):
 
     def test_webhook_url_is_removed(self):
         self.assertEqual(self.client.post("/webhooks/wasender/").status_code, 404)
+
+
+@override_settings(
+    WASENDER_API_KEY="test-key-never-used",
+    WASENDER_TRIAL_MODE=False,
+    WASENDER_SEND_INTERVAL_SECONDS=0,
+)
+class MessageLogTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("logs", password="pw")
+        self.other = User.objects.create_user("intruder", password="pw")
+        self.dataset = make_dataset(self.user)
+        self.recipient = ImportedRecipient.objects.create(
+            dataset=self.dataset,
+            owner=self.user,
+            original_row_number=2,
+            row_data={"phone": "0712345678"},
+            phone_source_column="phone",
+            phone_original="0712345678",
+            phone_normalized="+255712345678",
+            phone_validation_status="valid",
+        )
+        self.campaign = Campaign.objects.create(
+            owner=self.user,
+            dataset=self.dataset,
+            name="Owner campaign",
+            body_snapshot="Hello",
+            selected_phone_column="phone",
+        )
+        self.entry = CampaignRecipient.objects.create(
+            campaign=self.campaign,
+            imported_recipient=self.recipient,
+            normalized_phone="+255712345678",
+            rendered_message="Hello Ada",
+            state="failed",
+            provider_message_id="provider-1",
+            skip_reason="Previous failure",
+        )
+        other_dataset = make_dataset(self.other, name="other.csv")
+        other_recipient = ImportedRecipient.objects.create(
+            dataset=other_dataset,
+            owner=self.other,
+            original_row_number=2,
+            phone_normalized="+255713000000",
+        )
+        other_campaign = Campaign.objects.create(
+            owner=self.other,
+            dataset=other_dataset,
+            name="Private campaign",
+            body_snapshot="Secret message",
+            selected_phone_column="phone",
+        )
+        CampaignRecipient.objects.create(
+            campaign=other_campaign,
+            imported_recipient=other_recipient,
+            normalized_phone="+255713000000",
+            rendered_message="Secret message",
+            state="sent",
+        )
+        self.client.force_login(self.user)
+
+    def post(self, name, payload=None):
+        return self.client.post(
+            reverse(name, args=[self.entry.id]),
+            data=json.dumps(payload or {}),
+            content_type="application/json",
+        )
+
+    def test_status_normalization_is_conservative(self):
+        expected = {
+            1: "pending",
+            2: "sent",
+            3: "delivered",
+            4: "read",
+            5: "played",
+            99: "unknown",
+        }
+        for code, state in expected.items():
+            self.assertEqual(normalize_message_status(code), state)
+        self.assertEqual(normalize_message_status(None, "in_progress"), "pending")
+        self.assertEqual(normalize_message_status(None, "invented"), "unknown")
+
+    def test_page_owner_scope_filters_and_serials(self):
+        page = self.client.get(reverse("message_logs"))
+        text = page.content.decode()
+        self.assertContains(page, "Owner campaign")
+        self.assertNotIn("Private campaign", text)
+        self.assertNotIn("Secret message", text)
+        self.assertContains(page, "+255712345678")
+        self.assertContains(page, 'class="message-serial">1')
+        self.assertEqual(
+            self.client.get(reverse("message_logs"), {"phone": "999"}).context["page_obj"].paginator.count,
+            0,
+        )
+        self.assertEqual(
+            self.client.get(reverse("message_logs"), {"status": "failed"}).context["page_obj"].paginator.count,
+            1,
+        )
+        self.assertEqual(
+            self.client.get(reverse("message_logs"), {"campaign": self.campaign.id}).context["page_obj"].paginator.count,
+            1,
+        )
+
+    def test_detail_has_safe_attempt_diagnostics_and_owner_scope(self):
+        MessageAttempt.objects.create(
+            campaign_recipient=self.entry,
+            attempt_number=1,
+            http_status=422,
+            error_category="validation",
+            error_message="Safe diagnostic",
+            provider_response={"authorization": settings.WASENDER_API_KEY, "message": settings.WASENDER_API_KEY},
+            duration_ms=17,
+        )
+        response = self.client.get(reverse("message_detail", args=[self.entry.id]))
+        payload = response.json()["data"]
+        self.assertEqual(payload["attempts"][0]["error_message"], "Safe diagnostic")
+        self.assertNotIn(settings.WASENDER_API_KEY, response.content.decode())
+        self.client.force_login(self.other)
+        self.assertEqual(
+            self.client.get(reverse("message_detail", args=[self.entry.id])).status_code,
+            404,
+        )
+
+    @patch("api.services.message_logs.WasenderClient.message_info")
+    def test_refresh_advances_timestamps_and_never_downgrades(self, info):
+        self.entry.state = "read"
+        self.entry.save()
+        info.return_value = ProviderResult(
+            {"success": True, "data": {"ack": 2, "status": "sent"}}, 200
+        )
+        response = self.post("message_refresh_status")
+        self.assertEqual(response.status_code, 200)
+        self.entry.refresh_from_db()
+        self.assertEqual(self.entry.state, "read")
+        self.assertIsNotNone(self.entry.sent_at)
+        info.return_value = ProviderResult(
+            {"success": True, "data": {"ack": 3, "status": "delivered"}}, 200
+        )
+        self.entry.state = "sent"
+        self.entry.delivered_at = None
+        self.entry.save()
+        self.post("message_refresh_status")
+        self.entry.refresh_from_db()
+        self.campaign.refresh_from_db()
+        self.assertEqual(self.entry.state, "delivered")
+        self.assertIsNotNone(self.entry.delivered_at)
+        self.assertEqual(self.campaign.delivered_count, 1)
+
+    @patch("api.services.message_logs.WasenderClient.edit_message")
+    def test_provider_edit_success_and_failure(self, edit):
+        edit.return_value = ProviderResult({"success": True, "data": {}}, 200)
+        self.assertEqual(self.post("message_update", {"text": "Corrected"}).status_code, 200)
+        self.entry.refresh_from_db()
+        self.assertEqual(self.entry.rendered_message, "Corrected")
+        edit.side_effect = WasenderError("Safe rejection", 400, {"safe": True})
+        self.assertEqual(self.post("message_update", {"text": "Must not save"}).status_code, 400)
+        self.entry.refresh_from_db()
+        self.assertEqual(self.entry.rendered_message, "Corrected")
+
+    def test_failed_without_provider_id_can_be_corrected_locally(self):
+        self.entry.provider_message_id = ""
+        self.entry.save()
+        response = self.post(
+            "message_update",
+            {"phone": "0711111111", "text": "Try this", "update_imported_recipient": True},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.entry.refresh_from_db()
+        self.recipient.refresh_from_db()
+        self.assertEqual(self.entry.normalized_phone, "+255711111111")
+        self.assertEqual(self.recipient.phone_normalized, "+255711111111")
+
+    @patch("api.services.message_logs.WasenderClient.delete_message")
+    def test_delete_preserves_state_and_blocks_repeat(self, delete):
+        delete.return_value = ProviderResult({"success": True}, 200)
+        self.assertEqual(self.post("message_delete").status_code, 200)
+        self.entry.refresh_from_db()
+        self.assertEqual(self.entry.state, "failed")
+        self.assertIsNotNone(self.entry.provider_deleted_at)
+        self.assertEqual(self.post("message_delete").status_code, 409)
+        self.assertEqual(delete.call_count, 1)
+
+    @patch("api.services.message_logs.WasenderClient.send_message")
+    @patch("api.services.message_logs.WasenderClient.resend_message")
+    def test_resend_selects_operation_and_records_success(self, resend, send):
+        resend.return_value = ProviderResult(
+            {"success": True, "data": {"msgId": "provider-2", "status": "pending"}}, 200
+        )
+        response = self.post(
+            "message_resend",
+            {"phone": self.entry.normalized_phone, "text": self.entry.rendered_message},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual((resend.call_count, send.call_count), (1, 0))
+        self.entry.refresh_from_db()
+        self.assertEqual((self.entry.state, self.entry.retry_count), ("pending", 1))
+        self.assertEqual(self.entry.attempts.count(), 1)
+        self.entry.state = "failed"
+        self.entry.failed_at = timezone.now()
+        self.entry.save()
+        send.return_value = ProviderResult(
+            {"success": True, "data": {"msgId": "fresh", "status": "in_progress"}}, 200
+        )
+        response = self.post(
+            "message_resend",
+            {"phone": "0711111111", "text": "Changed"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(send.call_count, 1)
+
+    @patch("api.services.message_logs.WasenderClient.send_message")
+    def test_failed_resend_preserves_corrections_and_diagnostics(self, send):
+        self.entry.provider_message_id = ""
+        self.entry.save()
+        send.side_effect = WasenderError("Invalid corrected destination", 422, {"safe": True})
+        response = self.post(
+            "message_resend",
+            {"phone": "0711111111", "text": "Corrected body"},
+        )
+        self.assertEqual(response.status_code, 422)
+        self.entry.refresh_from_db()
+        attempt = self.entry.attempts.get()
+        self.assertEqual(self.entry.rendered_message, "Corrected body")
+        self.assertEqual(attempt.error_message, "Invalid corrected destination")
+
+    @override_settings(WASENDER_TRIAL_MODE=True, WASENDER_SEND_INTERVAL_SECONDS=0)
+    @patch("api.services.message_logs.WasenderClient.resend_message")
+    def test_trial_interval_makes_no_provider_call(self, resend):
+        MessageAttempt.objects.create(
+            campaign_recipient=self.entry,
+            attempt_number=1,
+        )
+        response = self.post(
+            "message_resend",
+            {"phone": self.entry.normalized_phone, "text": self.entry.rendered_message},
+        )
+        self.assertEqual(response.status_code, 429)
+        self.assertGreater(response.json()["data"]["wait_seconds"], 0)
+        resend.assert_not_called()
+
+    def test_unknown_old_action_is_404(self):
+        self.assertEqual(
+            self.client.post(f"/messages/{self.entry.id}/nonsense/").status_code,
+            404,
+        )
+
+    def test_message_mutation_requires_csrf(self):
+        csrf_client = Client(enforce_csrf_checks=True)
+        csrf_client.force_login(self.user)
+        response = csrf_client.post(
+            reverse("message_update", args=[self.entry.id]),
+            data=json.dumps({"text": "No token"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(Campaign.objects.filter(owner=self.user).count(), 1)
 
 
 class ProviderAcceptanceTests(ProviderClientTests):

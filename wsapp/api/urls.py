@@ -26,5 +26,11 @@ urlpatterns = [
     path("campaigns/<uuid:campaign_id>/resend-failed/", views.resend_failed, name="resend_failed"),
     path("campaigns/<uuid:campaign_id>/export/", views.export_campaign, name="export_campaign"),
     path("campaigns/<uuid:campaign_id>/<str:action>/", views.campaign_action, name="campaign_action"),
-    path("messages/<uuid:entry_id>/<str:action>/", views.message_action, name="message_action"),
+    path("messages/", views.message_logs, name="message_logs"),
+    path("messages/refresh-visible-statuses/", views.refresh_visible_statuses, name="refresh_visible_statuses"),
+    path("messages/<uuid:entry_id>/detail/", views.message_detail, name="message_detail"),
+    path("messages/<uuid:entry_id>/refresh-status/", views.message_refresh_status, name="message_refresh_status"),
+    path("messages/<uuid:entry_id>/update/", views.message_update, name="message_update"),
+    path("messages/<uuid:entry_id>/delete/", views.message_delete, name="message_delete"),
+    path("messages/<uuid:entry_id>/resend/", views.message_resend, name="message_resend"),
 ]

@@ -12,7 +12,7 @@ from django.utils import timezone
 from api.models import Campaign, CampaignRecipient, ImportedRecipient, MessageAttempt
 from api.services.media import ensure_media_ready
 from api.services.templates import render_message
-from api.services.wasender import WasenderClient, WasenderError
+from api.services.wasender import WasenderClient, WasenderError, safe_provider_payload
 
 logger = logging.getLogger(__name__)
 
@@ -237,24 +237,7 @@ def recover_stale_processing(campaign_id):
     return stale.count()
 
 
-def _safe_provider_payload(payload):
-    """Keep provider diagnostics while ensuring credentials can never be persisted."""
-    secret = str(settings.WASENDER_API_KEY or "")
-
-    def clean(value):
-        if isinstance(value, dict):
-            return {
-                str(key): clean(item)
-                for key, item in value.items()
-                if str(key).lower() not in {"authorization", "api_key", "apikey", "token"}
-            }
-        if isinstance(value, list):
-            return [clean(item) for item in value]
-        if isinstance(value, str) and secret:
-            return value.replace(secret, "[redacted]")
-        return value
-
-    return clean(payload if isinstance(payload, (dict, list)) else {})
+_safe_provider_payload = safe_provider_payload
 
 
 def send_next(campaign_id, owner_id, run_token):

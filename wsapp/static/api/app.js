@@ -284,14 +284,19 @@ const Waya = (() => {
       });
       $("#providerAlert").classList.toggle("d-none", data.provider_configured !== false);
       $("#recipientRows").innerHTML = data.recipients.map((row) => `
-        <tr class="${row.state === "processing" || row.sequence === sendingSequence ? "table-primary" : ""}">
+        <tr id="message-${row.id}" data-message-id="${row.id}" data-serial="${row.sequence}" class="${row.state === "processing" || row.sequence === sendingSequence ? "table-primary" : ""}">
           <td>${row.sequence ?? "—"}</td>
           <td>${escapeHtml(row.phone_masked)}</td>
-          <td class="preview-cell">${escapeHtml(row.preview)}</td>
-          <td><span class="badge state-${escapeHtml(row.state)}">${escapeHtml(row.state_label)}</span></td>
-          <td>${new Date(row.updated_at).toLocaleTimeString()}</td>
+          <td><button class="btn btn-link p-0 text-start preview-cell" data-message-action="detail">${escapeHtml(row.preview)}</button></td>
+          <td><button class="badge status-badge state-${row.is_deleted ? "deleted" : escapeHtml(row.state)}" data-message-action="detail">${row.is_deleted ? "⌫ Deleted" : escapeHtml(row.state_label)}</button></td>
           <td class="text-danger">${escapeHtml(row.error)}</td>
-          <td>${row.state === "failed" ? `<button class="btn btn-sm btn-outline-secondary" data-edit-recipient="${row.recipient_id}">Edit number</button>` : ""}</td>
+          <td class="text-end message-actions">
+            <button class="btn btn-sm btn-outline-secondary" data-message-action="detail">View</button>
+            <button class="btn btn-sm btn-outline-primary" data-message-action="refresh" ${!row.provider_message_id || row.is_deleted ? "disabled" : ""}>↻</button>
+            <button class="btn btn-sm btn-outline-secondary" data-message-action="update" ${row.is_deleted || (!row.provider_message_id && row.state !== "failed") ? "disabled" : ""}>Update</button>
+            <button class="btn btn-sm btn-outline-danger" data-message-action="delete" ${!row.provider_message_id || row.is_deleted ? "disabled" : ""}>Delete</button>
+            ${row.state === "failed" && !row.is_deleted ? '<button class="btn btn-sm btn-warning" data-message-action="resend">Resend</button>' : ""}
+          </td>
         </tr>`).join("") || '<tr><td colspan="7" class="empty">No campaign recipients yet.</td></tr>';
       $('[data-action="start"]').disabled = !data.can_start;
       $('[data-action="resume"]').disabled = !data.can_resume;
@@ -439,7 +444,7 @@ const Waya = (() => {
       if (!document.hidden) progress();
     });
     progress();
-    pollTimer = setInterval(progress, 5000);
+    pollTimer = setInterval(() => { if (!document.hidden) progress(); }, 25000);
   }
 
   function escapeHtml(value) {
@@ -448,5 +453,209 @@ const Waya = (() => {
     return node.innerHTML;
   }
 
-  return { request, toast, uploadForm, dataset, campaignForm, campaign };
+  function messageLogs(selector = "#messageRows") {
+    const rows = document.querySelector(selector);
+    if (!rows) return;
+    const detailModal = bootstrap.Modal.getOrCreateInstance("#messageDetailModal");
+    const updateModal = bootstrap.Modal.getOrCreateInstance("#messageUpdateModal");
+    const deleteModal = bootstrap.Modal.getOrCreateInstance("#messageDeleteModal");
+    const resendModal = bootstrap.Modal.getOrCreateInstance("#messageResendModal");
+    let activeRow = null;
+    let activeData = null;
+
+    const formatDate = (value) => value ? new Date(value).toLocaleString() : "—";
+    const rowFor = (target) => target.closest("[data-message-id]");
+
+    function statusIcon(state) {
+      return { pending: "◷", sent: "✓", delivered: "✓✓", read: "◉", played: "▶", failed: "!", deleted: "⌫", unknown: "?" }[state] || "?";
+    }
+
+    function actionButton(action, label, style, enabled = true) {
+      return `<button class="btn btn-sm ${style}" data-message-action="${action}" ${enabled ? "" : "disabled"}>${label}</button>`;
+    }
+
+    function renderRow(row, data) {
+      const serial = data.serial_number || row.dataset.serial;
+      row.dataset.serial = serial;
+      row.classList.add("message-row-updated");
+      row.innerHTML = `
+        <td class="message-serial">${escapeHtml(serial)}</td>
+        <td><span class="message-phone">${escapeHtml(data.phone)}</span><button type="button" class="btn btn-sm btn-link copy-phone" data-phone="${escapeHtml(data.phone)}" aria-label="Copy phone">⧉</button></td>
+        <td><button type="button" class="btn btn-link p-0 text-start message-preview" data-message-action="detail">${escapeHtml(data.message.length > 90 ? `${data.message.slice(0, 90)}…` : data.message)}</button></td>
+        <td><button class="badge status-badge state-${escapeHtml(data.state)}" data-message-action="detail">${statusIcon(data.state)} ${escapeHtml(data.state_label)}</button><small class="d-block text-muted delivery-note">${escapeHtml(data.delivery_explanation)}</small></td>
+        <td class="text-end message-actions">
+          ${actionButton("detail", "View", "btn-outline-secondary")}
+          ${actionButton("refresh", "↻", "btn-outline-primary", data.can_refresh_status)}
+          ${actionButton("update", "Update", "btn-outline-secondary", data.can_update)}
+          ${actionButton("delete", "Delete", "btn-outline-danger", data.can_delete)}
+          ${data.can_resend ? actionButton("resend", "Resend", "btn-warning") : ""}
+        </td>`;
+      setTimeout(() => row.classList.remove("message-row-updated"), 1400);
+    }
+
+    async function loadDetail(row, show = true) {
+      if (show) {
+        document.querySelector("#messageDetailBody").innerHTML = '<div class="message-skeleton"></div>';
+        detailModal.show();
+      }
+      const data = await request(`/messages/${row.dataset.messageId}/detail/?serial=${encodeURIComponent(row.dataset.serial)}`);
+      activeData = data;
+      if (!show) return data;
+      const attempts = data.attempts.map((attempt) => `
+        <article class="attempt-card">
+          <div class="d-flex justify-content-between"><strong>Attempt ${attempt.attempt_number}</strong><span>${escapeHtml(formatDate(attempt.attempted_at))}</span></div>
+          ${attempt.error_message ? `<div class="alert alert-danger mt-2 mb-2"><strong>${escapeHtml(attempt.error_category || "Failure")}</strong><br>${escapeHtml(attempt.error_message)}</div>` : ""}
+          <dl class="row small mb-1"><dt class="col-4">HTTP status</dt><dd class="col-8">${escapeHtml(attempt.http_status ?? "—")}</dd><dt class="col-4">Duration</dt><dd class="col-8">${escapeHtml(attempt.duration_ms)} ms</dd></dl>
+          <details><summary>Technical provider response</summary><pre class="safe-json">${escapeHtml(JSON.stringify(attempt.provider_response, null, 2))}</pre></details>
+        </article>`).join("") || '<p class="text-muted">No send attempts recorded.</p>';
+      document.querySelector("#messageDetailBody").innerHTML = `
+        <dl class="row message-detail-list">
+          <dt class="col-sm-4">S/N</dt><dd class="col-sm-8">${escapeHtml(data.serial_number || row.dataset.serial)}</dd>
+          <dt class="col-sm-4">Campaign</dt><dd class="col-sm-8">${escapeHtml(data.campaign_name)}</dd>
+          <dt class="col-sm-4">Original Excel row</dt><dd class="col-sm-8">${escapeHtml(data.original_row_number)}</dd>
+          <dt class="col-sm-4">Phone</dt><dd class="col-sm-8">${escapeHtml(data.phone)} <button class="btn btn-sm btn-link copy-phone" data-phone="${escapeHtml(data.phone)}">Copy</button></dd>
+          <dt class="col-sm-4">Status</dt><dd class="col-sm-8"><span class="badge state-${escapeHtml(data.state)}">${statusIcon(data.state)} ${escapeHtml(data.state_label)}</span> · ${escapeHtml(data.delivery_explanation)}</dd>
+          <dt class="col-sm-4">Provider message ID</dt><dd class="col-sm-8 text-break">${escapeHtml(data.provider_message_id || "Not assigned")}</dd>
+          <dt class="col-sm-4">Message</dt><dd class="col-sm-8 message-full">${escapeHtml(data.message)}</dd>
+          <dt class="col-sm-4">Sent / delivered / read</dt><dd class="col-sm-8">${escapeHtml(formatDate(data.sent_at))} / ${escapeHtml(formatDate(data.delivered_at))} / ${escapeHtml(formatDate(data.read_at))}</dd>
+          <dt class="col-sm-4">Edited / deleted</dt><dd class="col-sm-8">${escapeHtml(formatDate(data.edited_at))} / ${escapeHtml(formatDate(data.deleted_at))}</dd>
+          <dt class="col-sm-4">Last checked</dt><dd class="col-sm-8">${escapeHtml(formatDate(data.provider_status_checked_at))}</dd>
+          <dt class="col-sm-4">Retries</dt><dd class="col-sm-8">${escapeHtml(data.retry_count)}</dd>
+        </dl>
+        ${data.failure_reason ? `<div class="alert alert-danger"><strong>Failure reason</strong><br>${escapeHtml(data.failure_reason)}</div>` : ""}
+        <h3 class="h6 mt-4">Attempts</h3>${attempts}`;
+      return data;
+    }
+
+    async function postAction(row, action, body = {}) {
+      const data = await request(`/messages/${row.dataset.messageId}/${action}/`, {
+        method: "POST",
+        body: JSON.stringify({ ...body, serial_number: Number(row.dataset.serial) }),
+      });
+      renderRow(row, data.row);
+      toast(data.message || "Message updated.");
+      return data;
+    }
+
+    rows.addEventListener("click", async (event) => {
+      const copy = event.target.closest(".copy-phone");
+      if (copy) {
+        await navigator.clipboard.writeText(copy.dataset.phone);
+        toast("Phone number copied.");
+        return;
+      }
+      const button = event.target.closest("[data-message-action]");
+      if (!button || button.disabled) return;
+      const row = rowFor(button);
+      activeRow = row;
+      button.disabled = true;
+      try {
+        if (button.dataset.messageAction === "detail") await loadDetail(row);
+        if (button.dataset.messageAction === "refresh") await postAction(row, "refresh-status");
+        if (button.dataset.messageAction === "delete") deleteModal.show();
+        if (["update", "resend"].includes(button.dataset.messageAction)) {
+          const data = await loadDetail(row, false);
+          const form = document.querySelector(button.dataset.messageAction === "update" ? "#messageUpdateForm" : "#messageResendForm");
+          form.elements.id.value = data.id;
+          form.elements.phone.value = data.phone;
+          form.elements.text.value = data.message;
+          form.querySelector(".form-error").textContent = "";
+          if (button.dataset.messageAction === "update") {
+            form.querySelectorAll(".local-phone-field").forEach((field) => field.classList.toggle("d-none", Boolean(data.provider_message_id)));
+            updateModal.show();
+          } else {
+            form.querySelector(".previous-failure").textContent = data.failure_reason || "Previous send failed.";
+            resendModal.show();
+          }
+        }
+      } catch (error) {
+        toast(error.message);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    document.querySelector("#messageDetailBody").addEventListener("click", async (event) => {
+      const copy = event.target.closest(".copy-phone");
+      if (copy) {
+        await navigator.clipboard.writeText(copy.dataset.phone);
+        toast("Phone number copied.");
+      }
+    });
+
+    document.querySelector("#messageUpdateForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = event.submitter;
+      button.disabled = true;
+      try {
+        await postAction(activeRow, "update", {
+          phone: event.target.elements.phone.value,
+          text: event.target.elements.text.value,
+          update_imported_recipient: event.target.elements.update_imported_recipient.checked,
+        });
+        updateModal.hide();
+      } catch (error) {
+        event.target.querySelector(".form-error").textContent = error.message;
+      } finally { button.disabled = false; }
+    });
+
+    document.querySelector("#confirmMessageDelete").addEventListener("click", async (event) => {
+      event.target.disabled = true;
+      try {
+        await postAction(activeRow, "delete");
+        deleteModal.hide();
+      } catch (error) { toast(error.message); }
+      finally { event.target.disabled = false; }
+    });
+
+    document.querySelector("#messageResendForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = event.submitter;
+      button.disabled = true;
+      try {
+        await postAction(activeRow, "resend", {
+          phone: event.target.elements.phone.value,
+          text: event.target.elements.text.value,
+        });
+        resendModal.hide();
+      } catch (error) {
+        event.target.querySelector(".form-error").textContent = error.message;
+        const wait = error.payload?.data?.wait_seconds;
+        if (wait) {
+          let remaining = wait;
+          const node = event.target.querySelector(".resend-countdown");
+          const timer = setInterval(() => {
+            node.textContent = remaining > 0 ? `Resend available in ${remaining--} seconds.` : "";
+            if (remaining < 0) { clearInterval(timer); button.disabled = false; }
+          }, 1000);
+        }
+      } finally {
+        if (!event.target.querySelector(".resend-countdown").textContent) button.disabled = false;
+      }
+    });
+
+    document.querySelector("#refreshVisible")?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      const visibleRows = [...rows.querySelectorAll("[data-message-id]")];
+      const eligible = visibleRows.filter((row) => !row.querySelector('[data-message-action="refresh"]')?.disabled).slice(0, 25);
+      const progress = document.querySelector("#refreshProgress");
+      button.disabled = true;
+      progress.classList.remove("d-none");
+      progress.textContent = `0/${eligible.length} refreshed`;
+      try {
+        const serial_numbers = Object.fromEntries(eligible.map((row) => [row.dataset.messageId, Number(row.dataset.serial)]));
+        const data = await request("/messages/refresh-visible-statuses/", {
+          method: "POST",
+          body: JSON.stringify({ ids: eligible.map((row) => row.dataset.messageId), serial_numbers }),
+        });
+        data.results.forEach((result, index) => {
+          if (result.ok) renderRow(document.querySelector(`#message-${CSS.escape(result.id)}`), result.row);
+          progress.textContent = `${index + 1}/${eligible.length} refreshed`;
+        });
+      } catch (error) { toast(error.message); }
+      finally { button.disabled = false; }
+    });
+  }
+
+  return { request, toast, uploadForm, dataset, campaignForm, campaign, messageLogs };
 })();
