@@ -1,5 +1,4 @@
 import hashlib
-import hmac
 import json
 import uuid
 from pathlib import Path
@@ -13,11 +12,11 @@ from django.db.models import Count, Q
 from django.http import Http404, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
-from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST
 from openpyxl import Workbook
 
-from .models import Campaign, CampaignRecipient, ImportedRecipient, MessageTemplate, UploadedDataset, UploadedMedia, WebhookEvent
+from .models import Campaign, CampaignRecipient, ImportedRecipient, MessageTemplate, UploadedDataset, UploadedMedia
 from .services.imports import checksum, workbook_sheets
 from .services.campaigns import (
     ATTEMPTED_STATES,
@@ -34,7 +33,6 @@ from .services.media import upload_media
 from .services.phones import normalize_tanzania_phone
 from .services.templates import TemplateError, render_message, validate_template
 from .services.wasender import WasenderClient, WasenderError
-from .services.webhooks import process_webhook
 
 
 def ok(data=None, message=""):
@@ -65,6 +63,7 @@ def dashboard(request):
 
 
 @login_required
+@ensure_csrf_cookie
 def uploads(request):
     return render(request, "api/uploads.html", {"datasets": request.user.datasets.order_by("-created_at")})
 
@@ -96,6 +95,7 @@ def upload_create(request):
 
 
 @login_required
+@ensure_csrf_cookie
 def upload_detail(request, dataset_id):
     dataset = get_object_or_404(UploadedDataset, pk=dataset_id, owner=request.user)
     return render(request, "api/dataset.html", {"dataset": dataset})
@@ -225,6 +225,7 @@ def campaigns(request):
 
 
 @login_required
+@ensure_csrf_cookie
 def campaign_new(request, dataset_id):
     dataset = get_object_or_404(UploadedDataset, pk=dataset_id, owner=request.user)
     return render(request, "api/campaign_form.html", {"dataset": dataset})
@@ -271,6 +272,7 @@ def media_create(request):
 
 
 @login_required
+@ensure_csrf_cookie
 def campaign_detail(request, campaign_id):
     campaign = get_object_or_404(Campaign, pk=campaign_id, owner=request.user)
     return render(request, "api/campaign_detail.html", {"campaign": campaign})
@@ -341,7 +343,8 @@ def campaign_action(request, campaign_id, action):
         return ok(data, "Campaign ready to send.")
     elif action == "pause":
         campaign.status = Campaign.Status.PAUSED
-        campaign.save(update_fields=["status", "updated_at"])
+        campaign.run_token = uuid.uuid4().hex
+        campaign.save(update_fields=["status", "run_token", "updated_at"])
     elif action == "resume":
         if not campaign.campaign_recipients.filter(state="queued").exists():
             return error("No unsent recipients remain to resume.")
@@ -351,7 +354,8 @@ def campaign_action(request, campaign_id, action):
         return ok(data, "Campaign ready to resume.")
     elif action == "cancel":
         campaign.status = Campaign.Status.CANCELLED
-        campaign.save(update_fields=["status", "updated_at"])
+        campaign.run_token = uuid.uuid4().hex
+        campaign.save(update_fields=["status", "run_token", "updated_at"])
         campaign.campaign_recipients.filter(state="queued").update(state="cancelled")
         recalculate_campaign(campaign.id, finalize=False)
     campaign.refresh_from_db()
@@ -412,7 +416,12 @@ def campaign_progress_data(campaign):
         "attempts": r.attempts.count(), "updated_at": r.updated_at.isoformat(),
     } for r in order]
     accepted = states.get("accepted", 0) + states.get("pending", 0)
-    current = processing.sequence_number if processing else None
+    latest_attempt = recipients.filter(attempt_started_at__isnull=False).order_by(
+        "-attempt_started_at"
+    ).first()
+    current = processing.sequence_number if processing else (
+        latest_attempt.sequence_number if latest_attempt else None
+    )
     next_queued = recipients.filter(state="queued").order_by("sequence_number").first()
     media_needs_upload = bool(
         campaign.media_id
@@ -425,6 +434,7 @@ def campaign_progress_data(campaign):
     return {
         "status": campaign.status, "status_label": campaign.get_status_display(), "total": total,
         "sendable_total": sendable_total, "processed": processed, "completed": processed, "attempted": attempted,
+        "remaining": max(sendable_total - processed, 0),
         "current_number": current, "next_sequence": next_queued.sequence_number if next_queued else None,
         "progress_text": f"{processed}/{sendable_total}",
         "percent": round(processed / sendable_total * 100, 1) if sendable_total else 0,
@@ -441,6 +451,11 @@ def campaign_progress_data(campaign):
         "provider_configured": bool(settings.WASENDER_API_KEY),
         "media_needs_upload": media_needs_upload,
         "recipients": rows,
+        "latest_result": ({
+            "sequence": latest_attempt.sequence_number,
+            "state": latest_attempt.state,
+            "message": latest_attempt.skip_reason,
+        } if latest_attempt else None),
     }
 
 
@@ -527,26 +542,3 @@ def export_campaign(request, campaign_id):
     response["Content-Disposition"] = f'attachment; filename="campaign-{campaign.id}.xlsx"'
     wb.save(response)
     return response
-
-
-@csrf_exempt
-@require_POST
-def wasender_webhook(request):
-    secret = settings.WASENDER_WEBHOOK_SECRET
-    signature = request.headers.get("X-Webhook-Signature", "")
-    expected = hmac.new(secret.encode(), request.body, hashlib.sha256).hexdigest() if secret else ""
-    supplied = signature.removeprefix("sha256=")
-    if not secret or not hmac.compare_digest(expected, supplied): return JsonResponse({"ok": False}, status=401)
-    try: payload = json.loads(request.body)
-    except json.JSONDecodeError: return JsonResponse({"ok": False}, status=400)
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    event_hash = hashlib.sha256(canonical).hexdigest()
-    event, created = WebhookEvent.objects.get_or_create(event_hash=event_hash, defaults={"event_id": str(payload.get("id", "")), "event_type": str(payload.get("event") or payload.get("type") or ""), "signature_valid": True, "payload": payload})
-    if created:
-        try:
-            process_webhook(str(event.id))
-        except Exception as exc:
-            event.processing_state = "failed"
-            event.processing_error = str(exc)[:1000]
-            event.save(update_fields=["processing_state", "processing_error", "updated_at"])
-    return JsonResponse({"ok": True})

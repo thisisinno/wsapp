@@ -1,53 +1,50 @@
 # Waya — Excel to WhatsApp
 
 Waya is a Django 5 multi-user campaign application for importing Excel/CSV
-recipient data, editing and normalizing phone numbers, personalizing messages,
-uploading media, sending through Wasender, and tracking webhook delivery states.
+recipient data, editing and normalizing Tanzanian phone numbers, personalizing
+messages, uploading media, and sending through Wasender.
 
-## Setup
+## Development
+
+After installing `requirements.txt` and applying migrations, the only command
+needed to run the application is:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python manage.py migrate
-python manage.py runserver 0.0.0.0:8000
+python manage.py runserver 0.0.0.0:9000
 ```
 
-Copy the values you need from `.env.example` into your shell or process manager.
-The application does not automatically load an `.env` file. SQLite is used when
-`DATABASE_URL` is empty.
+Open the application through the forwarded port 9000 URL. Local HTTP/HTTPS port
+9000 and GitHub Codespaces `app.github.dev` origins are trusted for Django CSRF.
+The temporary private-trial Wasender key is configured server-side in
+`config/settings.py`; it is never sent to the browser. No `.env` file is needed
+for that key. SQLite is used when `DATABASE_URL` is empty.
 
 ## Sending model
 
-Sending is intentionally browser-driven. Start prepares an immutable recipient
-snapshot but sends nothing. While the campaign page remains open, the browser
-asks Django to process one recipient per request. Django enforces per-user
-serialization and provider spacing in database transactions, then records the
-real Wasender response before the browser advances.
+Sending is intentionally browser-driven. Start creates an immutable recipient
+snapshot but sends nothing. The browser asks Django to process one recipient per
+request. Django serializes claims in database transactions, makes one provider
+call, records the real response, and returns progress. In trial mode the browser
+waits through the visible 60-second countdown before requesting the next send.
 
-If the page or tab closes, automatic continuation pauses safely. Reopen the
-campaign and click **Resume** to continue from the first queued recipient.
-Already attempted recipients are not sent again.
+If the page or tab closes, reopen the campaign and click **Resume** to continue
+from the first queued recipient. Already successful recipients are not requeued.
+Provider acceptance means Wasender accepted or queued the message; it does not
+prove delivery or reading.
 
-Provider acceptance is distinct from the later sent, delivered, read, and played
-states supplied by signed webhooks.
+No Redis, Celery, worker, broker, Channels, WebSocket, or webhook process is
+required.
 
 ## Checks
 
 ```bash
-python manage.py check
 python manage.py makemigrations --check
+python manage.py migrate
+python manage.py check
 python manage.py test
 ```
 
-All automated provider calls are mocked. A separate guarded
-`test_wasender_live` management command remains available for deliberate manual
-integration diagnostics only.
+All automated provider calls are mocked. The guarded `test_wasender_live`
+management command is only for deliberate manual integration diagnostics.
 
-## Operational notes
-
-- Serve uploaded media from private/authenticated storage in production.
-- Configure the provider to sign the raw webhook body with HMAC-SHA256 in
-  `X-Webhook-Signature` (plain hex or an optional `sha256=` prefix).
-- Webhooks update delivery state synchronously and monotonically.
+Serve uploaded media from private/authenticated storage in production.

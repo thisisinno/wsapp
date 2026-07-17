@@ -1,24 +1,50 @@
 const Waya = (() => {
   function csrf() {
-    return document.cookie
+    const cookieToken = document.cookie
       .split("; ")
       .find((item) => item.startsWith("csrftoken="))
-      ?.split("=")[1] || document.querySelector("[name=csrfmiddlewaretoken]")?.value;
+      ?.split("=")[1];
+    return cookieToken ? decodeURIComponent(cookieToken) : document.querySelector("[name=csrfmiddlewaretoken]")?.value;
   }
 
   async function request(url, options = {}) {
-    options.headers = { ...(options.headers || {}), "X-CSRFToken": csrf() };
-    if (options.body && !(options.body instanceof FormData)) {
-      options.headers["Content-Type"] = "application/json";
+    const method = (options.method || "GET").toUpperCase();
+    const headers = new Headers(options.headers || {});
+    headers.set("X-Requested-With", "XMLHttpRequest");
+    if (!["GET", "HEAD", "OPTIONS", "TRACE"].includes(method)) {
+      const token = csrf();
+      if (token) headers.set("X-CSRFToken", token);
     }
-    const response = await fetch(url, options);
-    const payload = await response.json();
-    if (!response.ok || !payload.ok) {
-      const exception = new Error(payload.message || "Request failed");
+    if (options.body && !(options.body instanceof FormData) && !headers.has("Content-Type")) {
+      headers.set("Content-Type", "application/json");
+    }
+    let response;
+    try {
+      response = await fetch(url, { ...options, method, headers, credentials: "same-origin" });
+    } catch (networkError) {
+      throw new Error("Unable to reach the server. Check the connection and retry.");
+    }
+    const contentType = response.headers.get("content-type") || "";
+    let payload = null;
+    if (contentType.includes("application/json")) {
+      payload = await response.json().catch(() => null);
+    } else {
+      const text = await response.text();
+      payload = { ok: false, message: text && response.status !== 403 ? text.slice(0, 300) : "" };
+    }
+    if (!response.ok || !payload?.ok) {
+      let message = payload?.message || `Request failed (${response.status})`;
+      if (response.status === 403) {
+        message = "Security check failed. Refresh the page and retry.";
+      } else if (response.status === 401) {
+        message = "Your login session has expired. Sign in again.";
+      }
+      const exception = new Error(message);
       exception.status = response.status;
+      exception.payload = payload;
       throw exception;
     }
-    return payload.data;
+    return payload.data || {};
   }
 
   function toast(message) {
@@ -209,6 +235,13 @@ const Waya = (() => {
     let countdownTimer = null;
     let lastProgress = null;
 
+    function stopLoop() {
+      sendingLoopActive = false;
+      clearTimeout(loopTimer);
+      clearInterval(countdownTimer);
+      $("#nextSend").textContent = "";
+    }
+
     function formatWait(seconds) {
       return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
     }
@@ -231,17 +264,22 @@ const Waya = (() => {
     function render(data, sendingSequence = null) {
       lastProgress = data;
       const processed = data.processed ?? data.completed ?? 0;
-      const activeSequence = sendingSequence || data.current_number;
-      const heading = activeSequence
-        ? `${data.media_needs_upload ? "Preparing media… · " : ""}Sending ${activeSequence}/${data.sendable_total}`
-        : `${data.status === "sending" ? "Processed " : ""}${data.progress_text}`;
+      const activeSequence = sendingSequence || (data.processing ? data.current_number : null);
+      let heading = `Ready: ${data.progress_text}`;
+      if (activeSequence) {
+        heading = `${data.media_needs_upload ? "Preparing media… · " : ""}Sending ${activeSequence}/${data.sendable_total}`;
+      } else if (["completed", "completed_with_errors"].includes(data.status)) {
+        heading = `Complete: ${data.progress_text}`;
+      } else if (data.latest_result && processed) {
+        heading = `Processed ${data.progress_text} — ${data.latest_result.state}`;
+      }
       $("#campaignStatus").textContent = heading;
       $("#progressText").textContent = `${data.progress_text} · ${data.percent}%`;
       const bar = $("#campaignProgressBar");
       bar.style.width = `${data.percent}%`;
       bar.setAttribute("aria-valuenow", processed);
       bar.setAttribute("aria-valuemax", data.sendable_total || 1);
-      ["accepted", "sent", "delivered", "read", "failed", "skipped", "invalid"].forEach((key) => {
+      ["sendable_total", "processed", "accepted", "failed", "remaining", "skipped", "invalid"].forEach((key) => {
         $(`#${key}`).textContent = data[key];
       });
       $("#providerAlert").classList.toggle("d-none", data.provider_configured !== false);
@@ -302,17 +340,22 @@ const Waya = (() => {
         });
         render(data);
         if (data.finished || !["sending", "queued"].includes(data.status)) {
-          sendingLoopActive = false;
-          clearInterval(countdownTimer);
+          stopLoop();
           if (data.finished) sessionStorage.removeItem(tokenKey);
           return;
         }
         scheduleLoop(data.wait_seconds || data.retry_after || 0);
       } catch (error) {
-        sendingLoopActive = false;
+        stopLoop();
         const data = await progress();
-        if (data?.can_resume) toast("Connection changed during sending. Review progress, then Resume safely.");
-        else toast(error.message);
+        const resume = $('[data-action="resume"]');
+        if (data?.remaining > 0) {
+          resume.disabled = false;
+          resume.textContent = "Resume safely";
+          toast("Connection changed during sending. Review progress, then Resume safely.");
+        } else {
+          toast(error.message);
+        }
       } finally {
         pendingSendRequest = false;
       }
@@ -345,9 +388,7 @@ const Waya = (() => {
         } else if (name === "preflight") {
           await runPreflight(data.run_token, data.total);
         } else {
-          sendingLoopActive = false;
-          clearTimeout(loopTimer);
-          clearInterval(countdownTimer);
+          stopLoop();
           render(data);
         }
       } catch (error) {

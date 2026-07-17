@@ -27,5 +27,4 @@ urlpatterns = [
     path("campaigns/<uuid:campaign_id>/export/", views.export_campaign, name="export_campaign"),
     path("campaigns/<uuid:campaign_id>/<str:action>/", views.campaign_action, name="campaign_action"),
     path("messages/<uuid:entry_id>/<str:action>/", views.message_action, name="message_action"),
-    path("webhooks/wasender/", views.wasender_webhook, name="wasender_webhook"),
 ]

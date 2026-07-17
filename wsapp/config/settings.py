@@ -41,16 +41,19 @@ TEMPLATES = [{
 }]
 WSGI_APPLICATION = "config.wsgi.application"
 CSRF_COOKIE_HTTPONLY = False  # Allow JavaScript to access CSRF cookie
-CSRF_COOKIE_SAMESITE = 'Lax'
+CSRF_COOKIE_SAMESITE = "Lax"
+SESSION_COOKIE_SAMESITE = "Lax"
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 CSRF_TRUSTED_ORIGINS = [
-    'https://*.app.github.dev',  # Allow all GitHub Codespaces domains
-    'https://localhost:8000',
-]
-
-# CORS settings (if using django-cors-headers)
-CORS_ALLOWED_ORIGINS = [
-    'https://*.app.github.dev',  # Allow all GitHub Codespaces domains
-    'https://localhost:8000',
+    "http://localhost:8000",
+    "https://localhost:8000",
+    "http://localhost:9000",
+    "https://localhost:9000",
+    "http://127.0.0.1:8000",
+    "https://127.0.0.1:8000",
+    "http://127.0.0.1:9000",
+    "https://127.0.0.1:9000",
+    "https://*.app.github.dev",
 ]
 
 database_url = os.getenv("DATABASE_URL", "")
@@ -90,13 +93,12 @@ CACHES = {
 }
 WASENDER_API_BASE_URL = "https://www.wasenderapi.com"
 WASENDER_API_KEY = "0c5c283150371e044f207e7c2a9e7bf44cc135d8615dd417115c23bafd9c4ca3"
-WASENDER_WEBHOOK_SECRET = "fbcc4ceb3e57470bbe4726a7127edde7"
-WASENDER_TRIAL_MODE = env_bool("WASENDER_TRIAL_MODE", True)
-WASENDER_SEND_INTERVAL_SECONDS = int(os.getenv("WASENDER_SEND_INTERVAL_SECONDS", "60"))
+WASENDER_TRIAL_MODE = True
+WASENDER_SEND_INTERVAL_SECONDS = 60
 WASENDER_CHECK_INTERVAL_SECONDS = int(os.getenv("WASENDER_CHECK_INTERVAL_SECONDS", "2"))
 WASENDER_CHECK_CACHE_SECONDS = int(os.getenv("WASENDER_CHECK_CACHE_SECONDS", "604800"))
 WASENDER_MAX_CHECKS_PER_CAMPAIGN = int(os.getenv("WASENDER_MAX_CHECKS_PER_CAMPAIGN", "100"))
-WASENDER_CONNECT_TIMEOUT = float(os.getenv("WASENDER_CONNECT_TIMEOUT", "5"))
-WASENDER_READ_TIMEOUT = float(os.getenv("WASENDER_READ_TIMEOUT", "30"))
+WASENDER_CONNECT_TIMEOUT = 10
+WASENDER_READ_TIMEOUT = 45
 DATASET_MAX_BYTES = int(os.getenv("DATASET_MAX_BYTES", str(20 * 1024 * 1024)))
 MEDIA_MAX_BYTES = int(os.getenv("MEDIA_MAX_BYTES", str(16 * 1024 * 1024)))

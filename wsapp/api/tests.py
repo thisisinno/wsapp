@@ -1,14 +1,15 @@
-import hashlib
-import hmac
 import io
 import json
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import requests
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import TestCase, override_settings
+from django.conf import settings
+from django.test import Client, TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 from openpyxl import Workbook, load_workbook
 
 from .models import (
@@ -18,7 +19,6 @@ from .models import (
     MessageAttempt,
     UploadedDataset,
     UploadedMedia,
-    WebhookEvent,
 )
 from .services.campaigns import check_recipient, queue_campaign_entries
 from .services.imports import disambiguate_headers, parse_tabular
@@ -33,7 +33,6 @@ from .services.wasender import (
     WasenderClient,
     WasenderError,
 )
-from .services.webhooks import process_webhook
 
 User = get_user_model()
 
@@ -131,7 +130,7 @@ class CampaignSequentialTests(TestCase):
     @patch("api.services.campaigns.WasenderClient.send_message")
     def test_start_and_four_one_item_requests(self, send, check):
         check.return_value = ProviderResult({"data": {"exists": True}}, 200)
-        send.return_value = ProviderResult({"data": {"msgId": "m", "status": "accepted"}}, 200)
+        send.return_value = ProviderResult({"success": True, "data": {"msgId": "m", "status": "in_progress"}}, 200)
         first = self.start()
         self.assertEqual(first.status_code, 200)
         data = first.json()["data"]
@@ -162,7 +161,7 @@ class CampaignSequentialTests(TestCase):
     @patch("api.services.campaigns.WasenderClient.send_message")
     def test_trial_window_prevents_immediate_second_provider_call(self, send, check):
         check.return_value = ProviderResult({"data": {"exists": True}}, 200)
-        send.return_value = ProviderResult({"data": {"msgId": "m"}}, 200)
+        send.return_value = ProviderResult({"success": True, "data": {"msgId": "m"}}, 200)
         token = self.start().json()["data"]["run_token"]
         self.next(token)
         second = self.next(token).json()["data"]
@@ -174,12 +173,12 @@ class CampaignSequentialTests(TestCase):
     @patch("api.services.campaigns.WasenderClient.send_message")
     def test_idempotent_start_resume_token_and_no_duplicate_accepted(self, send, check):
         check.return_value = ProviderResult({"data": {"exists": True}}, 200)
-        send.return_value = ProviderResult({"data": {"msgId": "m"}}, 200)
+        send.return_value = ProviderResult({"success": True, "data": {"msgId": "m"}}, 200)
         first = self.start().json()["data"]
         second = self.start().json()["data"]
-        self.assertEqual(first["run_token"], second["run_token"])
+        self.assertNotEqual(first["run_token"], second["run_token"])
         self.assertEqual(self.campaign.campaign_recipients.count(), 4)
-        self.next(first["run_token"])
+        self.next(second["run_token"])
         self.client.post(
             reverse("campaign_action", args=[self.campaign.id, "pause"]),
             data="{}",
@@ -207,7 +206,7 @@ class CampaignSequentialTests(TestCase):
             content_type="application/json",
         )
         self.assertEqual(pause.status_code, 200)
-        self.assertEqual(self.next(token).json()["data"]["status"], "paused")
+        self.assertEqual(self.next(token).status_code, 409)
         self.client.post(
             reverse("campaign_action", args=[self.campaign.id, "cancel"]),
             data="{}",
@@ -215,19 +214,18 @@ class CampaignSequentialTests(TestCase):
         )
         self.assertEqual(send.call_count, 0)
 
-    @patch("api.services.campaigns.WasenderClient.check_number")
     @patch("api.services.campaigns.WasenderClient.send_message")
-    def test_not_registered_is_skipped_and_never_sent(self, send, check):
-        check.return_value = ProviderResult({"data": {"exists": False}}, 200)
+    def test_send_does_not_require_number_precheck(self, send):
+        send.return_value = ProviderResult({"success": True, "data": {"msgId": "m"}}, 200)
         token = self.start().json()["data"]["run_token"]
         data = self.next(token).json()["data"]
-        self.assertEqual(data["skipped"], 1)
-        self.assertEqual(send.call_count, 0)
+        self.assertEqual(data["accepted"], 1)
+        self.assertEqual(send.call_count, 1)
         self.assertEqual(
             self.campaign.campaign_recipients.order_by("sequence_number")
             .first()
-            .skip_reason,
-            "Not registered on WhatsApp",
+            .state,
+            "accepted",
         )
 
     @patch("api.services.campaigns.WasenderClient.check_number")
@@ -293,6 +291,34 @@ class CampaignSequentialTests(TestCase):
             load_workbook(io.BytesIO(response.content)).active["A1"].value, "row"
         )
 
+    @patch("api.services.campaigns.WasenderClient.send_message")
+    def test_unexpected_exception_marks_failed_and_never_leaks_key(self, send):
+        send.side_effect = RuntimeError(
+            f"unexpected detail {settings.WASENDER_API_KEY}"
+        )
+        token = self.start().json()["data"]["run_token"]
+        with self.assertLogs("api.services.campaigns", level="ERROR") as captured:
+            data = self.next(token).json()["data"]
+        entry = self.campaign.campaign_recipients.order_by("sequence_number").first()
+        entry.refresh_from_db()
+        self.assertEqual((data["failed"], entry.state), (1, "failed"))
+        self.assertIsNotNone(entry.attempt_finished_at)
+        self.assertNotIn(settings.WASENDER_API_KEY, json.dumps(data))
+        # logger.exception includes the original exception, so errors must not
+        # interpolate provider payloads or credentials into exception messages.
+        self.assertIn("Unexpected provider processing failure", captured.output[0])
+
+    @patch("api.services.campaigns.WasenderClient.send_message")
+    def test_busy_claim_does_not_make_provider_call(self, send):
+        token = self.start().json()["data"]["run_token"]
+        first = self.campaign.campaign_recipients.order_by("sequence_number").first()
+        first.state = CampaignRecipient.State.PROCESSING
+        first.attempt_started_at = timezone.now()
+        first.save()
+        data = self.next(token).json()["data"]
+        self.assertTrue(data["busy"])
+        self.assertEqual(send.call_count, 0)
+
 
 class SynchronousUploadMediaTests(TestCase):
     def setUp(self):
@@ -341,7 +367,7 @@ class ProviderClientTests(TestCase):
 
     def test_success_errors_timeout_and_non_json(self):
         result = self.client_for(
-            self.response(200, {"data": {"msgId": 1}})
+            self.response(200, {"success": True, "data": {"msgId": 1}})
         ).send_message("+255712345678", "Hi")
         self.assertEqual(result.http_status, 200)
         for status, exception in [
@@ -364,63 +390,76 @@ class ProviderClientTests(TestCase):
             )
 
 
-@override_settings(WASENDER_WEBHOOK_SECRET="hook-test-secret")
-class WebhookTests(TestCase):
+class CsrfAndFrontendTests(TestCase):
     def setUp(self):
-        user = User.objects.create_user("hook")
-        data = make_dataset(user)
-        recipient = ImportedRecipient.objects.create(
-            dataset=data,
-            owner=user,
-            original_row_number=2,
-            row_data={},
-            phone_normalized="+255712345678",
-            phone_validation_status="valid",
-        )
-        campaign = Campaign.objects.create(
-            owner=user,
-            dataset=data,
-            name="C",
-            body_snapshot="Hi",
-            selected_phone_column="phone",
-        )
-        self.entry = CampaignRecipient.objects.create(
-            campaign=campaign,
-            imported_recipient=recipient,
-            normalized_phone="+255712345678",
-            provider_message_id="123",
-            state="sent",
-        )
+        self.user = User.objects.create_user("csrf", password="pw")
+        self.dataset = make_dataset(self.user)
+        self.client = Client(enforce_csrf_checks=True)
+        self.client.force_login(self.user)
 
-    def signed_post(self, body):
-        signature = hmac.new(b"hook-test-secret", body, hashlib.sha256).hexdigest()
-        return self.client.post(
-            reverse("wasender_webhook"),
-            body,
+    def payload(self):
+        return json.dumps({
+            "name": "CSRF",
+            "body": "Hello",
+            "opt_in_confirmed": True,
+        })
+
+    def test_port_9000_is_trusted_and_valid_ajax_create_succeeds(self):
+        self.assertIn("https://localhost:9000", settings.CSRF_TRUSTED_ORIGINS)
+        page = self.client.get(reverse("campaign_new", args=[self.dataset.id]))
+        self.assertEqual(page.status_code, 200)
+        token = self.client.cookies["csrftoken"].value
+        response = self.client.post(
+            reverse("campaign_create", args=[self.dataset.id]),
+            self.payload(),
             content_type="application/json",
-            HTTP_X_WEBHOOK_SIGNATURE=signature,
+            HTTP_ORIGIN="https://localhost:9000",
+            HTTP_X_CSRFTOKEN=token,
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
         )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Campaign.objects.filter(owner=self.user).count(), 1)
 
-    def test_sync_signature_idempotency_and_monotonic_state(self):
-        body = json.dumps(
-            {"event": "messages.update", "data": {"msgId": "123", "status": 4}}
-        ).encode()
-        self.assertEqual(
-            self.client.post(
-                reverse("wasender_webhook"), body, content_type="application/json"
-            ).status_code,
-            401,
+    def test_missing_csrf_is_rejected_without_creating_campaign(self):
+        response = self.client.post(
+            reverse("campaign_create", args=[self.dataset.id]),
+            self.payload(),
+            content_type="application/json",
+            HTTP_ORIGIN="https://localhost:9000",
         )
-        self.assertEqual(self.signed_post(body).status_code, 200)
-        self.signed_post(body)
-        self.assertEqual(WebhookEvent.objects.count(), 1)
-        self.entry.refresh_from_db()
-        self.assertEqual(self.entry.state, "read")
-        older = WebhookEvent.objects.create(
-            event_hash="c" * 64,
-            signature_valid=True,
-            payload={"data": {"msgId": "123", "status": 2}},
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Campaign.objects.filter(owner=self.user).exists())
+
+    def test_javascript_handles_html_403_and_uses_same_origin_credentials(self):
+        source = (Path(settings.BASE_DIR) / "static/api/app.js").read_text()
+        self.assertIn('credentials: "same-origin"', source)
+        self.assertIn('contentType.includes("application/json")', source)
+        self.assertIn("Security check failed. Refresh the page and retry.", source)
+        self.assertNotIn("const payload = await response.json();", source)
+
+    def test_webhook_url_is_removed(self):
+        self.assertEqual(self.client.post("/webhooks/wasender/").status_code, 404)
+
+
+class ProviderAcceptanceTests(ProviderClientTests):
+    def test_2xx_success_false_is_failure(self):
+        with self.assertRaises(WasenderError):
+            self.client_for(
+                self.response(200, {"success": False, "message": "not accepted"})
+            ).send_message("+255712345678", "Hi")
+
+    def test_authorization_is_session_only_and_payload_is_minimal(self):
+        session = Mock()
+        session.headers = {}
+        session.request.return_value = self.response(
+            200, {"success": True, "data": {"msgId": 1}}
         )
-        process_webhook(older.id)
-        self.entry.refresh_from_db()
-        self.assertEqual(self.entry.state, "read")
+        WasenderClient(
+            api_key="server-secret",
+            base_url="https://example.invalid",
+            session=session,
+        ).send_message("+255712345678", "Hi")
+        self.assertEqual(session.headers["Authorization"], "Bearer server-secret")
+        kwargs = session.request.call_args.kwargs
+        self.assertNotIn("headers", kwargs)
+        self.assertEqual(kwargs["json"], {"to": "+255712345678", "text": "Hi"})

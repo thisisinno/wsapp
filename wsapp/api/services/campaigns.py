@@ -1,3 +1,4 @@
+import logging
 import time
 import uuid
 from datetime import timedelta
@@ -11,7 +12,9 @@ from django.utils import timezone
 from api.models import Campaign, CampaignRecipient, ImportedRecipient, MessageAttempt
 from api.services.media import ensure_media_ready
 from api.services.templates import render_message
-from api.services.wasender import RateLimitError, WasenderClient, WasenderError
+from api.services.wasender import WasenderClient, WasenderError
+
+logger = logging.getLogger(__name__)
 
 
 ATTEMPTED_STATES = {
@@ -58,8 +61,6 @@ def recalculate_campaign(campaign_id, finalize=True):
         campaign.status = (
             Campaign.Status.ERRORS
             if campaign.failed_count
-            or campaign.skipped_count
-            or counts.get("invalid", 0)
             else Campaign.Status.COMPLETED
         )
         campaign.completed_at = timezone.now()
@@ -144,8 +145,7 @@ def start_campaign(campaign):
         if not campaign.campaign_recipients.filter(state="queued").exists():
             recalculate_campaign(campaign.id)
             return campaign
-        if not campaign.run_token:
-            campaign.run_token = uuid.uuid4().hex
+        campaign.run_token = uuid.uuid4().hex
         now = timezone.now()
         campaign.status = Campaign.Status.SENDING
         campaign.started_at = campaign.started_at or now
@@ -166,7 +166,7 @@ def resume_campaign(campaign):
     with transaction.atomic():
         campaign = Campaign.objects.select_for_update().get(pk=campaign.pk)
         if campaign.campaign_recipients.filter(state="queued").exists():
-            campaign.run_token = campaign.run_token or uuid.uuid4().hex
+            campaign.run_token = uuid.uuid4().hex
             campaign.status = Campaign.Status.SENDING
             campaign.completed_at = None
             campaign.save(
@@ -210,6 +210,53 @@ def _interval_seconds():
     )
 
 
+def recover_stale_processing(campaign_id):
+    cutoff = timezone.now() - timedelta(
+        seconds=settings.WASENDER_CONNECT_TIMEOUT
+        + settings.WASENDER_READ_TIMEOUT
+        + 15
+    )
+    stale = CampaignRecipient.objects.filter(
+        campaign_id=campaign_id,
+        state=CampaignRecipient.State.PROCESSING,
+        attempt_started_at__lt=cutoff,
+    )
+    now = timezone.now()
+    for entry in stale.select_for_update():
+        entry.state = CampaignRecipient.State.FAILED
+        entry.failed_at = now
+        entry.attempt_finished_at = now
+        entry.skip_reason = "The previous send did not finish. It was marked failed safely."
+        entry.save(update_fields=[
+            "state", "failed_at", "attempt_finished_at", "skip_reason", "updated_at",
+        ])
+        entry.attempts.filter(error_message="").update(
+            error_category="stale_processing",
+            error_message=entry.skip_reason,
+        )
+    return stale.count()
+
+
+def _safe_provider_payload(payload):
+    """Keep provider diagnostics while ensuring credentials can never be persisted."""
+    secret = str(settings.WASENDER_API_KEY or "")
+
+    def clean(value):
+        if isinstance(value, dict):
+            return {
+                str(key): clean(item)
+                for key, item in value.items()
+                if str(key).lower() not in {"authorization", "api_key", "apikey", "token"}
+            }
+        if isinstance(value, list):
+            return [clean(item) for item in value]
+        if isinstance(value, str) and secret:
+            return value.replace(secret, "[redacted]")
+        return value
+
+    return clean(payload if isinstance(payload, (dict, list)) else {})
+
+
 def send_next(campaign_id, owner_id, run_token):
     now = timezone.now()
     with transaction.atomic():
@@ -228,6 +275,7 @@ def send_next(campaign_id, owner_id, run_token):
             Campaign.Status.ERRORS,
         }:
             return {"inactive": True}
+        recover_stale_processing(campaign.id)
         busy = CampaignRecipient.objects.filter(
             campaign__owner_id=owner_id, state=CampaignRecipient.State.PROCESSING
         ).exists()
@@ -271,56 +319,40 @@ def send_next(campaign_id, owner_id, run_token):
     started = time.monotonic()
     result_name = "failed"
     try:
-        source = ImportedRecipient.objects.get(pk=entry.imported_recipient_id)
-        whatsapp_state = check_recipient(source)
-        if whatsapp_state == ImportedRecipient.WhatsApp.NOT_EXISTS:
-            with transaction.atomic():
-                locked = CampaignRecipient.objects.select_for_update().get(pk=entry.pk)
-                locked.state = CampaignRecipient.State.SKIPPED
-                locked.skip_reason = "Not registered on WhatsApp"
-                locked.attempt_finished_at = timezone.now()
-                locked.save()
-                attempt.error_category = "not_registered"
-                attempt.error_message = locked.skip_reason
-                attempt.duration_ms = int((time.monotonic() - started) * 1000)
-                attempt.save()
-            result_name = "skipped"
-        elif whatsapp_state == ImportedRecipient.WhatsApp.ERROR:
-            raise WasenderError("Unable to verify WhatsApp registration.")
-        else:
-            media_field = media_url = None
-            if campaign.media:
-                media = ensure_media_ready(campaign.media)
-                media_field = {
-                    "image": "imageUrl",
-                    "video": "videoUrl",
-                    "audio": "audioUrl",
-                    "document": "documentUrl",
-                }.get(media.media_type)
-                media_url = media.provider_public_url
-            provider = WasenderClient().send_message(
-                entry.normalized_phone,
-                entry.rendered_message,
-                media_field,
-                media_url,
-            )
-            data = provider.data.get("data", provider.data)
-            with transaction.atomic():
-                locked = CampaignRecipient.objects.select_for_update().get(pk=entry.pk)
-                locked.state = CampaignRecipient.State.ACCEPTED
-                locked.provider_message_id = str(data.get("msgId", ""))
-                locked.provider_jid = str(data.get("jid", ""))
-                locked.provider_status_text = str(data.get("status", "accepted"))
-                locked.last_provider_payload = provider.data
-                locked.attempt_finished_at = timezone.now()
-                locked.skip_reason = ""
-                locked.save()
-                attempt.http_status = provider.http_status
-                attempt.provider_response = provider.data
-                attempt.provider_message_id = locked.provider_message_id
-                attempt.duration_ms = int((time.monotonic() - started) * 1000)
-                attempt.save()
-            result_name = "accepted"
+        media_field = media_url = None
+        if campaign.media:
+            media = ensure_media_ready(campaign.media)
+            media_field = {
+                "image": "imageUrl",
+                "video": "videoUrl",
+                "audio": "audioUrl",
+                "document": "documentUrl",
+            }.get(media.media_type)
+            media_url = media.provider_public_url
+        provider = WasenderClient().send_message(
+            entry.normalized_phone,
+            entry.rendered_message,
+            media_field,
+            media_url,
+        )
+        data = provider.data.get("data", {})
+        safe_payload = _safe_provider_payload(provider.data)
+        with transaction.atomic():
+            locked = CampaignRecipient.objects.select_for_update().get(pk=entry.pk)
+            locked.state = CampaignRecipient.State.ACCEPTED
+            locked.provider_message_id = str(data.get("msgId", ""))
+            locked.provider_jid = str(data.get("jid", ""))
+            locked.provider_status_text = str(data.get("status", "accepted"))
+            locked.last_provider_payload = safe_payload
+            locked.attempt_finished_at = timezone.now()
+            locked.skip_reason = ""
+            locked.save()
+            attempt.http_status = provider.http_status
+            attempt.provider_response = safe_payload
+            attempt.provider_message_id = locked.provider_message_id
+            attempt.duration_ms = int((time.monotonic() - started) * 1000)
+            attempt.save()
+        result_name = "accepted"
     except WasenderError as exc:
         with transaction.atomic():
             locked = CampaignRecipient.objects.select_for_update().get(pk=entry.pk)
@@ -330,24 +362,45 @@ def send_next(campaign_id, owner_id, run_token):
             locked.skip_reason = str(exc)[:255]
             locked.save()
             attempt.http_status = exc.status
-            attempt.provider_response = exc.payload
+            attempt.provider_response = _safe_provider_payload(exc.payload)
             attempt.error_category = exc.category
             attempt.error_message = str(exc)[:1000]
             attempt.duration_ms = int((time.monotonic() - started) * 1000)
             attempt.save()
-
-    with transaction.atomic():
-        campaign = Campaign.objects.select_for_update().get(pk=campaign_id)
-        counts = recalculate_campaign(campaign.id, finalize=False)
-        next_entry = campaign.campaign_recipients.filter(state="queued").order_by(
-            "sequence_number", "created_at"
-        ).first()
-        wait_seconds = _interval_seconds() if next_entry else 0
-        if next_entry:
-            next_entry.scheduled_for = timezone.now() + timedelta(seconds=wait_seconds)
-            next_entry.save(update_fields=["scheduled_for", "updated_at"])
-        else:
-            recalculate_campaign(campaign.id, finalize=True)
+    except Exception:
+        # Log a traceback-shaped safe diagnostic without interpolating the
+        # original exception, which may contain a provider response.
+        try:
+            raise RuntimeError("Unexpected provider processing error.") from None
+        except RuntimeError:
+            logger.exception(
+                "Unexpected provider processing failure for campaign recipient %s",
+                entry.pk,
+            )
+        with transaction.atomic():
+            locked = CampaignRecipient.objects.select_for_update().get(pk=entry.pk)
+            locked.state = CampaignRecipient.State.FAILED
+            locked.failed_at = timezone.now()
+            locked.attempt_finished_at = timezone.now()
+            locked.skip_reason = "An unexpected server error prevented this send."
+            locked.save()
+            attempt.error_category = "unexpected"
+            attempt.error_message = locked.skip_reason
+            attempt.duration_ms = int((time.monotonic() - started) * 1000)
+            attempt.save()
+    finally:
+        with transaction.atomic():
+            campaign = Campaign.objects.select_for_update().get(pk=campaign_id)
+            recalculate_campaign(campaign.id, finalize=False)
+            next_entry = campaign.campaign_recipients.filter(state="queued").order_by(
+                "sequence_number", "created_at"
+            ).first()
+            wait_seconds = _interval_seconds() if next_entry else 0
+            if next_entry:
+                next_entry.scheduled_for = timezone.now() + timedelta(seconds=wait_seconds)
+                next_entry.save(update_fields=["scheduled_for", "updated_at"])
+            else:
+                recalculate_campaign(campaign.id, finalize=True)
     return {
         "sent_now": True,
         "attempted_sequence": sequence,

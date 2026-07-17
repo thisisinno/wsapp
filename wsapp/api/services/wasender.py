@@ -25,20 +25,25 @@ class ProviderResult:
     http_status: int
 
 
+def _safe_message(value):
+    message = str(value)
+    secret = str(settings.WASENDER_API_KEY or "")
+    return message.replace(secret, "[redacted]") if secret else message
+
+
 class WasenderClient:
     def __init__(self, api_key=None, base_url=None, session=None):
         self.api_key = settings.WASENDER_API_KEY if api_key is None else api_key
         self.base_url = (base_url or settings.WASENDER_API_BASE_URL).rstrip("/")
         self.session = session or requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json",
+        })
         retry = Retry(total=2, connect=2, read=0, status=2, status_forcelist=(502, 503, 504), allowed_methods=frozenset({"GET"}), backoff_factor=.3)
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
 
-    @property
-    def headers(self):
-        return {"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"}
-
     def _request(self, method, path, **kwargs):
-        kwargs.setdefault("headers", self.headers)
         kwargs.setdefault("timeout", (settings.WASENDER_CONNECT_TIMEOUT, settings.WASENDER_READ_TIMEOUT))
         try:
             response = self.session.request(method, f"{self.base_url}{path}", **kwargs)
@@ -52,8 +57,8 @@ class WasenderClient:
             payload = {"message": response.text[:500]} if response.text else {}
             if response.ok:
                 raise MalformedResponseError("Provider returned a non-JSON response.", response.status_code)
-        message = payload.get("message") or payload.get("error") or f"Provider returned HTTP {response.status_code}"
-        if response.status_code == 401: raise UnauthorizedError(message, 401, payload)
+        message = _safe_message(payload.get("message") or payload.get("error") or f"Provider returned HTTP {response.status_code}")
+        if response.status_code == 401: raise UnauthorizedError("Provider authentication failed.", 401, payload)
         if response.status_code == 422: raise ValidationError(message, 422, payload)
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After") or payload.get("retry_after")
@@ -66,11 +71,14 @@ class WasenderClient:
         payload = {"to": phone}
         if text: payload["text"] = text
         if media_field and media_url: payload[media_field] = media_url
-        return self._request("POST", "/api/send-message", json=payload)
+        result = self._request("POST", "/api/send-message", json=payload)
+        if result.data.get("success") is not True:
+            message = result.data.get("message") or result.data.get("error") or "Provider rejected the message."
+            raise WasenderError(_safe_message(message), result.http_status, result.data)
+        return result
     def check_number(self, phone): return self._request("GET", f"/api/on-whatsapp/{phone}")
     def upload_media(self, fileobj, mime):
-        headers = {**self.headers, "Content-Type": mime}
-        return self._request("POST", "/api/upload", headers=headers, data=fileobj)
+        return self._request("POST", "/api/upload", headers={"Content-Type": mime}, data=fileobj)
     def edit_message(self, message_id, text): return self._request("PUT", f"/api/messages/{message_id}", json={"text": text})
     def message_info(self, message_id): return self._request("GET", f"/api/messages/{message_id}/info")
     def delete_message(self, message_id): return self._request("DELETE", f"/api/messages/{message_id}")

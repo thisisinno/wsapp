@@ -1,7 +1,7 @@
 # Wasender API reference (sanitized)
 
-Never place credentials in this file. Configure `WASENDER_API_KEY` in the
-runtime environment. Requests authenticate with a server-side Bearer token.
+Never place credentials in this file. Requests authenticate with the temporary
+server-side Bearer token configured in Django settings.
 
 Base URL: `https://www.wasenderapi.com`
 
@@ -21,5 +21,4 @@ An accepted send commonly returns:
 {"success": true, "data": {"msgId": 100000, "jid": "example", "status": "in_progress"}}
 ```
 
-`in_progress` means accepted or queued, not delivered. Provider status codes
-are: `0` failed, `1` pending, `2` sent, `3` delivered, `4` read, `5` played.
+`in_progress` means accepted or queued, not delivered.
