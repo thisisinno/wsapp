@@ -2,12 +2,8 @@ import hashlib
 import hmac
 import json
 import uuid
-from datetime import timedelta
 from pathlib import Path
 
-from celery.exceptions import TimeoutError as CeleryTimeoutError
-from kombu.exceptions import OperationalError
-from redis.exceptions import ConnectionError as RedisConnectionError, TimeoutError as RedisTimeoutError
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ValidationError
@@ -23,13 +19,22 @@ from openpyxl import Workbook
 
 from .models import Campaign, CampaignRecipient, ImportedRecipient, MessageTemplate, UploadedDataset, UploadedMedia, WebhookEvent
 from .services.imports import checksum, workbook_sheets
-from .services.infrastructure import get_messaging_health
+from .services.campaigns import (
+    ATTEMPTED_STATES,
+    SENDABLE_STATES,
+    preflight_next,
+    queue_campaign_entries,
+    recalculate_campaign,
+    resume_campaign,
+    send_next,
+    start_campaign,
+)
+from .services.datasets import normalize_dataset, process_dataset
+from .services.media import upload_media
 from .services.phones import normalize_tanzania_phone
 from .services.templates import TemplateError, render_message, validate_template
 from .services.wasender import WasenderClient, WasenderError
-from .tasks import (normalize_dataset, preflight_next_recipient, process_dataset,
-                    process_webhook, queue_campaign_entries, recalculate_campaign,
-                    send_next_campaign_recipient, upload_media)
+from .services.webhooks import process_webhook
 
 
 def ok(data=None, message=""):
@@ -83,11 +88,11 @@ def upload_create(request):
     if len(sheets) > 1 and not request.POST.get("sheet_name"):
         return ok({"id": str(dataset.id), "sheets": sheets, "requires_sheet": True})
     sheet = request.POST.get("sheet_name") or sheets[0]
-    if file.size < 1024 * 1024:
-        process_dataset(str(dataset.id), sheet, int(request.POST.get("header_row", 1)))
-    else:
-        process_dataset.delay(str(dataset.id), sheet, int(request.POST.get("header_row", 1)))
-    return ok({"id": str(dataset.id), "url": f"/uploads/{dataset.id}/", "requires_sheet": False}, "Upload saved.")
+    process_dataset(str(dataset.id), sheet, int(request.POST.get("header_row", 1)))
+    dataset.refresh_from_db()
+    if dataset.processing_status == UploadedDataset.Status.FAILED:
+        return error(dataset.processing_error or "Workbook processing failed.")
+    return ok({"id": str(dataset.id), "url": f"/uploads/{dataset.id}/", "requires_sheet": False, "status": dataset.processing_status}, "Workbook processed.")
 
 
 @login_required
@@ -105,8 +110,11 @@ def select_sheet(request, dataset_id):
     with dataset.original_file.open("rb") as source:
         sheets = workbook_sheets(source, f".{dataset.file_type}")
     if sheet not in sheets: return error("Unknown worksheet.", {"sheet_name": ["Choose a detected worksheet."]})
-    process_dataset.delay(str(dataset.id), sheet, int(data.get("header_row", 1)))
-    return ok({"url": f"/uploads/{dataset.id}/"}, "Worksheet queued for import.")
+    process_dataset(str(dataset.id), sheet, int(data.get("header_row", 1)))
+    dataset.refresh_from_db()
+    if dataset.processing_status == UploadedDataset.Status.FAILED:
+        return error(dataset.processing_error or "Worksheet processing failed.")
+    return ok({"url": f"/uploads/{dataset.id}/", "status": dataset.processing_status}, "Worksheet imported.")
 
 
 @login_required
@@ -256,8 +264,10 @@ def media_create(request):
     for chunk in file.chunks(): digest.update(chunk)
     file.seek(0)
     media = UploadedMedia.objects.create(owner=request.user, original_file=file, original_filename=Path(file.name).name[:255], mime_type=mime, media_type=types[mime], size=file.size, checksum=digest.hexdigest())
-    upload_media.delay(str(media.id))
-    return ok({"id": str(media.id), "status": media.upload_status}, "Media retained and queued for upload.")
+    media = upload_media(str(media.id))
+    if media.upload_status == UploadedMedia.Status.FAILED:
+        return error(media.upload_error or "Provider media upload failed.", data={"id": str(media.id), "status": media.upload_status})
+    return ok({"id": str(media.id), "status": media.upload_status}, "Media retained and uploaded.")
 
 
 @login_required
@@ -279,62 +289,34 @@ def campaign_preview(request, campaign_id):
 
 
 @login_required
-@require_GET
-def messaging_health(request):
-    return ok({"health": get_messaging_health()})
-
-
-QUEUE_EXCEPTIONS = (OperationalError, RedisConnectionError, RedisTimeoutError, CeleryTimeoutError, ConnectionError, TimeoutError)
-
-
-def infrastructure_error(health, exc=None):
-    detail = str(exc)[:200] if exc else next(iter(health.get("errors", [])), health["message"])
-    return error(
-        health["message"], {"infrastructure": [detail]}, status=503,
-        data={"health": {k: health[k] for k in ("broker_ok", "cache_ok", "worker_ok", "ready")}},
+@require_POST
+def campaign_preflight(request, campaign_id):
+    campaign = get_object_or_404(Campaign, pk=campaign_id, owner=request.user)
+    eligible = campaign.dataset.recipients.filter(
+        selected=True, phone_validation_status__in=["valid", "warning"], suppressed=False
     )
-
-
-def enqueue_dispatcher(campaign, task, health):
-    token = uuid.uuid4().hex
-    now = timezone.now()
-    Campaign.objects.filter(pk=campaign.pk).update(run_token=token, queue_error="", dispatch_task_id="", last_enqueued_at=None)
-    try:
-        result = task.apply_async(args=[str(campaign.id), token])
-    except QUEUE_EXCEPTIONS as exc:
-        message = str(exc)[:500]
-        Campaign.objects.filter(pk=campaign.pk, run_token=token).update(
-            status=Campaign.Status.READY, dispatch_task_id="", queue_error=message, run_token="",
-        )
-        return None, infrastructure_error(health, exc)
-    Campaign.objects.filter(pk=campaign.pk, run_token=token).update(
-        status=Campaign.Status.QUEUED, dispatch_task_id=result.id or "", last_enqueued_at=now,
-        last_progress_at=now, queue_error="",
+    count = min(eligible.count(), settings.WASENDER_MAX_CHECKS_PER_CAMPAIGN)
+    if not count:
+        return error("No eligible recipients are available for preflight.")
+    campaign.run_token = uuid.uuid4().hex
+    campaign.status = Campaign.Status.CHECKING
+    campaign.save(update_fields=["run_token", "status", "updated_at"])
+    return ok(
+        {"run_token": campaign.run_token, "total": count, "checked": 0},
+        "Preflight ready.",
     )
-    campaign.refresh_from_db()
-    return result, None
 
 
 @login_required
 @require_POST
-def campaign_preflight(request, campaign_id):
+def campaign_preflight_next(request, campaign_id):
     campaign = get_object_or_404(Campaign, pk=campaign_id, owner=request.user)
-    health = get_messaging_health()
-    if not health["ready"]:
-        return infrastructure_error(health)
-    eligible = campaign.dataset.recipients.filter(
-        selected=True, phone_validation_status__in=["valid", "warning"], suppressed=False
-    )[:settings.WASENDER_MAX_CHECKS_PER_CAMPAIGN]
-    count = len(eligible)
-    if not count:
-        return error("No eligible recipients are available for preflight.")
-    campaign.status = Campaign.Status.CHECKING
-    campaign.save(update_fields=["status", "updated_at"])
-    result, response = enqueue_dispatcher(campaign, preflight_next_recipient, health)
-    if response:
-        return response
-    Campaign.objects.filter(pk=campaign.pk).update(status=Campaign.Status.CHECKING)
-    return ok({"queued": count, "task_id": result.id})
+    result = preflight_next(
+        campaign.id, request.user.id, json_body(request).get("run_token", "")
+    )
+    if result.get("conflict"):
+        return error("This preflight token is no longer valid.", status=409)
+    return ok(result)
 
 
 @login_required
@@ -350,45 +332,55 @@ def campaign_action(request, campaign_id, action):
             return error("Select at least one recipient before starting.")
         if not settings.WASENDER_API_KEY:
             return error("WhatsApp API key is not configured.", {"configuration": ["Set WASENDER_API_KEY."]})
-        active = campaign.status in {Campaign.Status.QUEUED, Campaign.Status.SENDING} and bool(campaign.dispatch_task_id)
-        recent = campaign.last_progress_at and campaign.last_progress_at > timezone.now() - timedelta(minutes=3)
-        if active and recent:
-            return ok(campaign_progress_data(campaign), "Campaign dispatcher is already active.")
-        health = get_messaging_health()
-        if not health["ready"]:
-            campaign.status = Campaign.Status.READY
-            campaign.queue_error = health["message"]
-            campaign.save(update_fields=["status", "queue_error", "updated_at"])
-            return infrastructure_error(health)
-        counts = queue_campaign_entries(campaign)
-        if not counts["queued"]:
-            return error("There are no sendable queued recipients.", {"recipients": ["Review skipped and invalid recipient reasons."]}, data={"counts": counts})
-        _, response = enqueue_dispatcher(campaign, send_next_campaign_recipient, health)
-        if response:
-            return response
-        return ok(campaign_progress_data(campaign), "Campaign queued.")
+        campaign = start_campaign(campaign)
+        if not campaign.campaign_recipients.filter(state="queued").exists():
+            return error("There are no sendable queued recipients.", {"recipients": ["Review skipped and invalid recipient reasons."]}, data=campaign_progress_data(campaign))
+        data = campaign_progress_data(campaign)
+        data["run_token"] = campaign.run_token
+        data["wait_seconds"] = data["seconds_until_next"] or 0
+        return ok(data, "Campaign ready to send.")
     elif action == "pause":
-        campaign.run_token = ""
-        campaign.dispatch_task_id = ""
         campaign.status = Campaign.Status.PAUSED
-        campaign.save(update_fields=["run_token", "dispatch_task_id", "status", "updated_at"])
+        campaign.save(update_fields=["status", "updated_at"])
     elif action == "resume":
         if not campaign.campaign_recipients.filter(state="queued").exists():
             return error("No unsent recipients remain to resume.")
-        health = get_messaging_health()
-        if not health["ready"]:
-            return infrastructure_error(health)
-        _, response = enqueue_dispatcher(campaign, send_next_campaign_recipient, health)
-        if response:
-            return response
+        campaign = resume_campaign(campaign)
+        data = campaign_progress_data(campaign)
+        data["run_token"] = campaign.run_token
+        return ok(data, "Campaign ready to resume.")
     elif action == "cancel":
-        campaign.run_token = ""
-        campaign.dispatch_task_id = ""
         campaign.status = Campaign.Status.CANCELLED
-        campaign.save(update_fields=["run_token", "dispatch_task_id", "status", "updated_at"])
+        campaign.save(update_fields=["status", "updated_at"])
         campaign.campaign_recipients.filter(state="queued").update(state="cancelled")
         recalculate_campaign(campaign.id, finalize=False)
-    return ok({"status": campaign.status})
+    campaign.refresh_from_db()
+    return ok(campaign_progress_data(campaign))
+
+
+@login_required
+@require_POST
+def campaign_send_next(request, campaign_id):
+    campaign = get_object_or_404(Campaign, pk=campaign_id, owner=request.user)
+    result = send_next(
+        campaign.id, request.user.id, json_body(request).get("run_token", "")
+    )
+    if result.get("conflict"):
+        return error("This campaign run token is no longer valid.", status=409)
+    campaign.refresh_from_db()
+    data = campaign_progress_data(campaign)
+    data.update(result)
+    if result.get("busy"):
+        data["sent_now"] = False
+        data["wait_seconds"] = result["retry_after"]
+    elif "wait_seconds" in result and not result.get("sent_now"):
+        data["sent_now"] = False
+    message = (
+        f"Recipient {result['attempted_sequence']} processed."
+        if result.get("attempted_sequence")
+        else ""
+    )
+    return ok(data, message)
 
 
 def mask_phone(phone):
@@ -401,17 +393,14 @@ def campaign_progress_data(campaign):
     recipients = campaign.campaign_recipients.select_related("imported_recipient")
     states = dict(recipients.values("state").annotate(n=Count("id")).values_list("state", "n"))
     total = sum(states.values())
-    sendable_total = total - states.get("skipped", 0) - states.get("invalid", 0)
-    terminal = {"accepted", "pending", "sent", "delivered", "read", "played", "failed", "skipped", "invalid", "cancelled"}
-    completed = sum(states.get(state, 0) for state in terminal)
+    sendable_total = sum(states.get(state, 0) for state in SENDABLE_STATES)
+    processed = sum(states.get(state, 0) for state in ATTEMPTED_STATES)
     attempted = recipients.filter(Q(attempt_started_at__isnull=False) | Q(attempts__isnull=False)).distinct().count()
     processing = recipients.filter(state="processing").order_by("sequence_number").first()
     scheduled = recipients.filter(state="queued", scheduled_for__isnull=False).order_by("scheduled_for").first()
     now = timezone.now()
     next_send_at = scheduled.scheduled_for if scheduled else None
     seconds = max(0, int((next_send_at - now).total_seconds())) if next_send_at else None
-    stale = campaign.status in {"queued", "sending"} and campaign.last_progress_at and campaign.last_progress_at < now - timedelta(minutes=3)
-    health = get_messaging_health()
     order = recipients.annotate(priority=models.Case(
         models.When(state="processing", then=0), models.When(state="failed", then=1), default=2,
         output_field=models.IntegerField(),
@@ -424,18 +413,33 @@ def campaign_progress_data(campaign):
     } for r in order]
     accepted = states.get("accepted", 0) + states.get("pending", 0)
     current = processing.sequence_number if processing else None
+    next_queued = recipients.filter(state="queued").order_by("sequence_number").first()
+    media_needs_upload = bool(
+        campaign.media_id
+        and (
+            not campaign.media.provider_public_url
+            or not campaign.media.provider_url_expires_at
+            or campaign.media.provider_url_expires_at <= now
+        )
+    )
     return {
         "status": campaign.status, "status_label": campaign.get_status_display(), "total": total,
-        "sendable_total": sendable_total, "completed": completed, "attempted": attempted,
-        "current_number": current, "progress_text": f"{completed}/{sendable_total}",
-        "percent": round(completed / sendable_total * 100, 1) if sendable_total else 0,
+        "sendable_total": sendable_total, "processed": processed, "completed": processed, "attempted": attempted,
+        "current_number": current, "next_sequence": next_queued.sequence_number if next_queued else None,
+        "progress_text": f"{processed}/{sendable_total}",
+        "percent": round(processed / sendable_total * 100, 1) if sendable_total else 0,
         "queued": states.get("queued", 0), "processing": states.get("processing", 0),
         "accepted": accepted, "sent": states.get("sent", 0), "delivered": states.get("delivered", 0),
         "read": states.get("read", 0) + states.get("played", 0), "failed": states.get("failed", 0),
         "skipped": states.get("skipped", 0), "invalid": states.get("invalid", 0),
         "cancelled": states.get("cancelled", 0), "next_send_at": next_send_at.isoformat() if next_send_at else None,
-        "seconds_until_next": seconds, "stalled": bool(stale), "queue_error": campaign.queue_error,
-        "health": {k: health[k] for k in ("broker_ok", "cache_ok", "worker_ok", "ready", "message")},
+        "seconds_until_next": seconds,
+        "can_start": campaign.status in {"draft", "ready"},
+        "can_resume": campaign.status == "paused" and bool(next_queued),
+        "can_pause": campaign.status == "sending",
+        "can_cancel": campaign.status in {"sending", "paused"} and bool(next_queued),
+        "provider_configured": bool(settings.WASENDER_API_KEY),
+        "media_needs_upload": media_needs_upload,
         "recipients": rows,
     }
 
@@ -479,9 +483,6 @@ def resend_failed(request, campaign_id):
     count = entries.count()
     if not count:
         return error("No failed recipients are available to resend.")
-    health = get_messaging_health()
-    if not health["ready"]:
-        return infrastructure_error(health)
     requeued = 0
     for entry in entries.select_related("imported_recipient"):
         source = entry.imported_recipient
@@ -505,11 +506,12 @@ def resend_failed(request, campaign_id):
     if not requeued:
         recalculate_campaign(campaign.id)
         return error("No corrected failed recipients are sendable.")
-    _, response = enqueue_dispatcher(campaign, send_next_campaign_recipient, health)
-    if response:
-        entries.filter(state="queued").update(state="failed")
-        return response
-    return ok({"queued": requeued}, f"{requeued} failed recipients requeued.")
+    campaign = resume_campaign(campaign)
+    recalculate_campaign(campaign.id, finalize=False)
+    data = campaign_progress_data(Campaign.objects.get(pk=campaign.id))
+    data["run_token"] = campaign.run_token
+    data["requeued"] = requeued
+    return ok(data, f"{requeued} failed recipients requeued.")
 
 
 @login_required
@@ -540,5 +542,11 @@ def wasender_webhook(request):
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     event_hash = hashlib.sha256(canonical).hexdigest()
     event, created = WebhookEvent.objects.get_or_create(event_hash=event_hash, defaults={"event_id": str(payload.get("id", "")), "event_type": str(payload.get("event") or payload.get("type") or ""), "signature_valid": True, "payload": payload})
-    if created: process_webhook.delay(str(event.id))
+    if created:
+        try:
+            process_webhook(str(event.id))
+        except Exception as exc:
+            event.processing_state = "failed"
+            event.processing_error = str(exc)[:1000]
+            event.save(update_fields=["processing_state", "processing_error", "updated_at"])
     return JsonResponse({"ok": True})

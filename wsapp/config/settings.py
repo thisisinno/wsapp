@@ -45,16 +45,12 @@ CSRF_COOKIE_SAMESITE = 'Lax'
 CSRF_TRUSTED_ORIGINS = [
     'https://*.app.github.dev',  # Allow all GitHub Codespaces domains
     'https://localhost:8000',
-    'https://localhost:6379',
-    'https://localhost:9000',
 ]
 
 # CORS settings (if using django-cors-headers)
 CORS_ALLOWED_ORIGINS = [
     'https://*.app.github.dev',  # Allow all GitHub Codespaces domains
     'https://localhost:8000',
-    'https://localhost:9000',
-    'https://localhost:6379',
 ]
 
 database_url = os.getenv("DATABASE_URL", "")
@@ -86,42 +82,15 @@ LOGIN_URL = "login"
 LOGIN_REDIRECT_URL = "dashboard"
 LOGOUT_REDIRECT_URL = "login"
 
-APP_ASYNC_MODE = os.getenv("APP_ASYNC_MODE", "celery").strip().lower()
-if APP_ASYNC_MODE not in {"celery", "eager-dev"}:
-    raise ImproperlyConfigured("APP_ASYNC_MODE must be 'celery' or 'eager-dev'")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", REDIS_URL)
-_result_backend = os.getenv("CELERY_RESULT_BACKEND", "").strip()
-CELERY_RESULT_BACKEND = _result_backend or None
-CELERY_TASK_IGNORE_RESULT = True
-if APP_ASYNC_MODE == "eager-dev":
-    CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache", "LOCATION": "waya-eager-dev"}}
-    CELERY_TASK_ALWAYS_EAGER = True
-else:
-    CACHE_URL = os.getenv("CACHE_URL", "redis://localhost:6379/1")
-    CACHES = {"default": {"BACKEND": "django.core.cache.backends.redis.RedisCache", "LOCATION": CACHE_URL}}
-    CELERY_TASK_ALWAYS_EAGER = env_bool("CELERY_TASK_ALWAYS_EAGER", False)
-CELERY_TASK_EAGER_PROPAGATES = True
-CELERY_ACCEPT_CONTENT = ["json"]
-CELERY_TASK_SERIALIZER = "json"
-CELERY_RESULT_SERIALIZER = "json"
-CELERY_ENABLE_UTC = True
-CELERY_TIMEZONE = TIME_ZONE
-CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
-CELERY_TASK_ACKS_LATE = True
-CELERY_TASK_REJECT_ON_WORKER_LOST = True
-CELERY_WORKER_PREFETCH_MULTIPLIER = 1
-CELERY_TASK_SOFT_TIME_LIMIT = int(os.getenv("CELERY_TASK_SOFT_TIME_LIMIT", "90"))
-CELERY_TASK_TIME_LIMIT = int(os.getenv("CELERY_TASK_TIME_LIMIT", "120"))
-CELERY_BEAT_SCHEDULE = {
-    "reconcile-pending-messages": {
-        "task": "api.tasks.reconcile_pending_messages",
-        "schedule": 900.0,
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "waya-local-only",
     }
 }
-WASENDER_API_BASE_URL = os.getenv("WASENDER_API_BASE_URL", "https://www.wasenderapi.com").rstrip("/")
-WASENDER_API_KEY = os.getenv("WASENDER_API_KEY", "")
-WASENDER_WEBHOOK_SECRET = os.getenv("WASENDER_WEBHOOK_SECRET", "")
+WASENDER_API_BASE_URL = "https://www.wasenderapi.com"
+WASENDER_API_KEY = "0c5c283150371e044f207e7c2a9e7bf44cc135d8615dd417115c23bafd9c4ca3"
+WASENDER_WEBHOOK_SECRET = "fbcc4ceb3e57470bbe4726a7127edde7"
 WASENDER_TRIAL_MODE = env_bool("WASENDER_TRIAL_MODE", True)
 WASENDER_SEND_INTERVAL_SECONDS = int(os.getenv("WASENDER_SEND_INTERVAL_SECONDS", "60"))
 WASENDER_CHECK_INTERVAL_SECONDS = int(os.getenv("WASENDER_CHECK_INTERVAL_SECONDS", "2"))
