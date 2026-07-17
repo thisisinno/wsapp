@@ -1,0 +1,29 @@
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path("", views.dashboard, name="dashboard"),
+    path("uploads/", views.uploads, name="uploads"),
+    path("uploads/new/", views.upload_create, name="upload_create"),
+    path("uploads/<uuid:dataset_id>/", views.upload_detail, name="upload_detail"),
+    path("uploads/<uuid:dataset_id>/sheet/", views.select_sheet, name="select_sheet"),
+    path("uploads/<uuid:dataset_id>/columns/", views.columns, name="columns"),
+    path("uploads/<uuid:dataset_id>/select-phone-column/", views.select_phone_column, name="select_phone_column"),
+    path("recipients/<uuid:recipient_id>/edit-phone/", views.edit_phone, name="edit_phone"),
+    path("datasets/<uuid:dataset_id>/recipients/", views.recipients, name="recipients"),
+    path("datasets/<uuid:dataset_id>/bulk-edit/", views.bulk_edit_phones, name="bulk_edit_phones"),
+    path("datasets/<uuid:dataset_id>/selection/", views.selection, name="selection"),
+    path("campaigns/", views.campaigns, name="campaigns"),
+    path("campaigns/new/<uuid:dataset_id>/", views.campaign_new, name="campaign_new"),
+    path("campaigns/create/<uuid:dataset_id>/", views.campaign_create, name="campaign_create"),
+    path("media/new/", views.media_create, name="media_create"),
+    path("campaigns/<uuid:campaign_id>/", views.campaign_detail, name="campaign_detail"),
+    path("campaigns/<uuid:campaign_id>/preview/", views.campaign_preview, name="campaign_preview"),
+    path("campaigns/<uuid:campaign_id>/preflight/", views.campaign_preflight, name="campaign_preflight"),
+    path("campaigns/<uuid:campaign_id>/progress/", views.campaign_progress, name="campaign_progress"),
+    path("campaigns/<uuid:campaign_id>/resend-failed/", views.resend_failed, name="resend_failed"),
+    path("campaigns/<uuid:campaign_id>/export/", views.export_campaign, name="export_campaign"),
+    path("campaigns/<uuid:campaign_id>/<str:action>/", views.campaign_action, name="campaign_action"),
+    path("messages/<uuid:entry_id>/<str:action>/", views.message_action, name="message_action"),
+    path("webhooks/wasender/", views.wasender_webhook, name="wasender_webhook"),
+]

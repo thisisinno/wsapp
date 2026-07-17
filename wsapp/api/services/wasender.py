@@ -1,0 +1,77 @@
+import json
+from dataclasses import dataclass
+
+import requests
+from django.conf import settings
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+class WasenderError(Exception):
+    category = "provider"
+    def __init__(self, message, status=None, payload=None, retry_after=None):
+        super().__init__(message); self.status = status; self.payload = payload or {}; self.retry_after = retry_after
+class UnauthorizedError(WasenderError): category = "unauthorized"
+class ValidationError(WasenderError): category = "validation"
+class RateLimitError(WasenderError): category = "rate_limit"
+class ConnectionError(WasenderError): category = "connection"
+class TimeoutError(WasenderError): category = "timeout"
+class MalformedResponseError(WasenderError): category = "malformed_response"
+
+
+@dataclass
+class ProviderResult:
+    data: dict
+    http_status: int
+
+
+class WasenderClient:
+    def __init__(self, api_key=None, base_url=None, session=None):
+        self.api_key = settings.WASENDER_API_KEY if api_key is None else api_key
+        self.base_url = (base_url or settings.WASENDER_API_BASE_URL).rstrip("/")
+        self.session = session or requests.Session()
+        retry = Retry(total=2, connect=2, read=0, status=2, status_forcelist=(502, 503, 504), allowed_methods=frozenset({"GET"}), backoff_factor=.3)
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+
+    @property
+    def headers(self):
+        return {"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"}
+
+    def _request(self, method, path, **kwargs):
+        kwargs.setdefault("headers", self.headers)
+        kwargs.setdefault("timeout", (settings.WASENDER_CONNECT_TIMEOUT, settings.WASENDER_READ_TIMEOUT))
+        try:
+            response = self.session.request(method, f"{self.base_url}{path}", **kwargs)
+        except requests.Timeout as exc:
+            raise TimeoutError("Provider request timed out.") from exc
+        except requests.ConnectionError as exc:
+            raise ConnectionError("Could not connect to provider.") from exc
+        try:
+            payload = response.json()
+        except (ValueError, json.JSONDecodeError):
+            payload = {"message": response.text[:500]} if response.text else {}
+            if response.ok:
+                raise MalformedResponseError("Provider returned a non-JSON response.", response.status_code)
+        message = payload.get("message") or payload.get("error") or f"Provider returned HTTP {response.status_code}"
+        if response.status_code == 401: raise UnauthorizedError(message, 401, payload)
+        if response.status_code == 422: raise ValidationError(message, 422, payload)
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After") or payload.get("retry_after")
+            raise RateLimitError(message, 429, payload, retry_after)
+        if response.status_code >= 400: raise WasenderError(message, response.status_code, payload)
+        if not isinstance(payload, dict): raise MalformedResponseError("Malformed provider payload.", response.status_code)
+        return ProviderResult(payload, response.status_code)
+
+    def send_message(self, phone, text="", media_field=None, media_url=None):
+        payload = {"to": phone}
+        if text: payload["text"] = text
+        if media_field and media_url: payload[media_field] = media_url
+        return self._request("POST", "/api/send-message", json=payload)
+    def check_number(self, phone): return self._request("GET", f"/api/on-whatsapp/{phone}")
+    def upload_media(self, fileobj, mime):
+        headers = {**self.headers, "Content-Type": mime}
+        return self._request("POST", "/api/upload", headers=headers, data=fileobj)
+    def edit_message(self, message_id, text): return self._request("PUT", f"/api/messages/{message_id}", json={"text": text})
+    def message_info(self, message_id): return self._request("GET", f"/api/messages/{message_id}/info")
+    def delete_message(self, message_id): return self._request("DELETE", f"/api/messages/{message_id}")
+    def resend_message(self, message_id): return self._request("POST", f"/api/messages/{message_id}/resend")
