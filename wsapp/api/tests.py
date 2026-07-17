@@ -6,10 +6,12 @@ import tempfile
 from unittest.mock import Mock, patch
 
 import requests
+from kombu.exceptions import OperationalError
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 from openpyxl import Workbook, load_workbook
 
 from .models import Campaign, CampaignRecipient, ImportedRecipient, UploadedDataset, WebhookEvent
@@ -112,6 +114,104 @@ class OwnershipSelectionCampaignTests(TestCase):
         self.assertEqual(response.status_code, 200)
         wb = load_workbook(io.BytesIO(response.content))
         self.assertEqual(wb.active["A1"].value, "row")
+
+
+@override_settings(WASENDER_API_KEY="test-key-never-used")
+class CampaignQueueRegressionTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("queue-user", password="pw")
+        self.data = dataset(self.user)
+        for number in range(4):
+            ImportedRecipient.objects.create(
+                dataset=self.data, owner=self.user, original_row_number=number + 2,
+                row_data={"phone": f"071234567{number}", "name": f"Person {number}"},
+                phone_source_column="phone", phone_normalized=f"+25571234567{number}",
+                phone_validation_status="valid",
+            )
+        self.campaign = Campaign.objects.create(
+            owner=self.user, dataset=self.data, name="Four", body_snapshot="Hi {name}",
+            selected_phone_column="phone", opt_in_confirmed=True, allow_unknown=True,
+            status=Campaign.Status.READY,
+        )
+        self.client.force_login(self.user)
+        self.url = reverse("campaign_action", args=[self.campaign.id, "start"])
+        self.ready = {
+            "broker_ok": True, "cache_ok": True, "worker_ok": True, "ready": True,
+            "message": "ready", "errors": [],
+        }
+
+    @patch("api.views.get_messaging_health")
+    def test_unavailable_infrastructure_returns_503_and_never_queues(self, health):
+        health.return_value = {**self.ready, "broker_ok": False, "worker_ok": False, "ready": False, "message": "Messaging queue is unavailable.", "errors": ["Redis connection refused"]}
+        response = self.client.post(self.url, data="{}", content_type="application/json")
+        self.assertEqual(response.status_code, 503)
+        self.campaign.refresh_from_db()
+        self.assertEqual(self.campaign.status, Campaign.Status.READY)
+        self.assertTrue(self.campaign.queue_error)
+        self.assertFalse(response.json()["data"]["health"]["ready"])
+
+    @patch("api.views.send_next_campaign_recipient.apply_async")
+    @patch("api.views.get_messaging_health")
+    def test_enqueue_failure_restores_ready_and_second_start_retries(self, health, enqueue):
+        health.return_value = self.ready
+        enqueue.side_effect = [OperationalError("connection refused"), Mock(id="accepted-task")]
+        first = self.client.post(self.url, data="{}", content_type="application/json")
+        self.assertEqual(first.status_code, 503)
+        self.campaign.refresh_from_db()
+        self.assertEqual(self.campaign.status, Campaign.Status.READY)
+        self.assertEqual(self.campaign.dispatch_task_id, "")
+        second = self.client.post(self.url, data="{}", content_type="application/json")
+        self.assertEqual(second.status_code, 200)
+        self.campaign.refresh_from_db()
+        self.assertEqual(self.campaign.status, Campaign.Status.QUEUED)
+        self.assertEqual(self.campaign.dispatch_task_id, "accepted-task")
+
+    @patch("api.views.send_next_campaign_recipient.apply_async")
+    @patch("api.views.get_messaging_health")
+    def test_snapshot_exists_before_enqueue_and_double_start_is_idempotent(self, health, enqueue):
+        health.return_value = self.ready
+        enqueue.return_value = Mock(id="one-task")
+        response = self.client.post(self.url, data="{}", content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["total"], 4)
+        self.assertEqual(response.json()["data"]["progress_text"], "0/4")
+        self.assertEqual(self.campaign.campaign_recipients.count(), 4)
+        again = self.client.post(self.url, data="{}", content_type="application/json")
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual(enqueue.call_count, 1)
+
+    @patch("api.views.get_messaging_health")
+    def test_progress_masks_phone_and_keeps_accepted_distinct(self, health):
+        health.return_value = self.ready
+        queue_campaign_entries(self.campaign)
+        entries = list(self.campaign.campaign_recipients.order_by("sequence_number"))
+        entries[0].state = CampaignRecipient.State.ACCEPTED
+        entries[0].attempt_started_at = timezone.now()
+        entries[0].attempt_finished_at = timezone.now()
+        entries[0].save()
+        entries[1].state = CampaignRecipient.State.FAILED
+        entries[1].attempt_started_at = timezone.now()
+        entries[1].attempt_finished_at = timezone.now()
+        entries[1].save()
+        response = self.client.get(reverse("campaign_progress", args=[self.campaign.id]))
+        data = response.json()["data"]
+        self.assertEqual((data["completed"], data["accepted"], data["failed"]), (2, 1, 1))
+        self.assertEqual(data["delivered"], 0)
+        self.assertNotIn("+255712345670", json.dumps(data["recipients"]))
+        self.assertEqual(response["Cache-Control"], "no-store")
+
+    @patch("api.views.preflight_next_recipient.apply_async", side_effect=OperationalError("broker down"))
+    @patch("api.views.get_messaging_health")
+    def test_preflight_enqueue_failure_restores_ready(self, health, enqueue):
+        health.return_value = self.ready
+        response = self.client.post(reverse("campaign_preflight", args=[self.campaign.id]), data="{}", content_type="application/json")
+        self.assertEqual(response.status_code, 503)
+        self.campaign.refresh_from_db()
+        self.assertEqual(self.campaign.status, Campaign.Status.READY)
+
+    def test_unknown_action_is_rejected(self):
+        response = self.client.post(reverse("campaign_action", args=[self.campaign.id, "bogus"]), data="{}", content_type="application/json")
+        self.assertEqual(response.status_code, 400)
 
 
 class ProviderClientTests(TestCase):

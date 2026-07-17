@@ -22,17 +22,25 @@ the application does not automatically load it. SQLite is used when
 `DATABASE_URL` is empty. PostgreSQL example:
 `postgresql://user:password@localhost:5432/waya`.
 
-## Workers
+## Codespaces/development services
 
-Start Redis, then:
+Normal sending requires Redis and a live Celery worker. Run `bash scripts/dev.sh`
+for checks and commands, or use separate terminals:
 
 ```bash
-celery -A config worker --loglevel=INFO
+redis-server --daemonize yes
+redis-cli ping
+celery -A config worker --loglevel=INFO --pool=solo
 celery -A config beat --loglevel=INFO
+python manage.py runserver 0.0.0.0:8000
+python manage.py messaging_health
 ```
 
-The trial configuration enforces a minimum 60-second per-user send lock and
-schedules individual messages; it never sleeps in a web request.
+`APP_ASYNC_MODE=eager-dev` uses an in-memory cache and eager Celery execution
+only for development/test utilities. It does not reproduce one-minute
+background scheduling and must not be used as the normal sending mode. Trial
+mode schedules one dispatcher at a time with at least 60 seconds between
+provider attempts; it never sleeps in a web request.
 
 ## Tests and live command
 

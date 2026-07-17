@@ -130,12 +130,17 @@ class Campaign(UUIDTimeModel):
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
     send_config_snapshot = models.JSONField(default=dict)
+    dispatch_task_id = models.CharField(max_length=255, blank=True, default="")
+    queue_error = models.TextField(blank=True, default="")
+    last_progress_at = models.DateTimeField(null=True, blank=True)
+    last_enqueued_at = models.DateTimeField(null=True, blank=True)
+    run_token = models.CharField(max_length=64, blank=True, default="")
 
 
 class CampaignRecipient(UUIDTimeModel):
     class State(models.TextChoices):
         INVALID = "invalid", "Invalid"; SKIPPED = "skipped", "Skipped"; CANCELLED = "cancelled", "Cancelled"
-        QUEUED = "queued", "Queued"; ACCEPTED = "accepted", "Provider accepted"; PENDING = "pending", "Pending"
+        QUEUED = "queued", "Queued"; PROCESSING = "processing", "Sending"; ACCEPTED = "accepted", "Provider accepted"; PENDING = "pending", "Pending"
         SENT = "sent", "Sent"; DELIVERED = "delivered", "Delivered"; READ = "read", "Read"
         PLAYED = "played", "Played"; FAILED = "failed", "Failed"
     campaign = models.ForeignKey(Campaign, on_delete=models.CASCADE, related_name="campaign_recipients")
@@ -155,6 +160,10 @@ class CampaignRecipient(UUIDTimeModel):
     read_at = models.DateTimeField(null=True, blank=True)
     failed_at = models.DateTimeField(null=True, blank=True)
     retry_count = models.PositiveIntegerField(default=0)
+    sequence_number = models.PositiveIntegerField(null=True, blank=True)
+    scheduled_for = models.DateTimeField(null=True, blank=True)
+    attempt_started_at = models.DateTimeField(null=True, blank=True)
+    attempt_finished_at = models.DateTimeField(null=True, blank=True)
     class Meta:
         constraints = [models.UniqueConstraint(fields=["campaign", "imported_recipient"], name="unique_campaign_recipient")]
 

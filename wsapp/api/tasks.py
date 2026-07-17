@@ -2,6 +2,7 @@ import hashlib
 import json
 import random
 import time
+import uuid
 from datetime import timedelta
 
 from celery import shared_task
@@ -93,11 +94,47 @@ def check_recipient(self, recipient_id):
         recipient.save(update_fields=["whatsapp_state", "updated_at"])
 
 
+TERMINAL_STATES = {
+    CampaignRecipient.State.ACCEPTED, CampaignRecipient.State.PENDING, CampaignRecipient.State.SENT,
+    CampaignRecipient.State.DELIVERED, CampaignRecipient.State.READ, CampaignRecipient.State.PLAYED,
+    CampaignRecipient.State.FAILED, CampaignRecipient.State.SKIPPED, CampaignRecipient.State.INVALID,
+    CampaignRecipient.State.CANCELLED,
+}
+
+
+def recalculate_campaign(campaign_id, finalize=True):
+    campaign = Campaign.objects.get(pk=campaign_id)
+    counts = dict(campaign.campaign_recipients.values("state").annotate(n=Count("id")).values_list("state", "n"))
+    campaign.total_count = sum(counts.values())
+    campaign.queued_count = counts.get("queued", 0)
+    campaign.sent_count = sum(counts.get(s, 0) for s in ["accepted", "pending", "sent", "delivered", "read", "played"])
+    campaign.delivered_count = sum(counts.get(s, 0) for s in ["delivered", "read", "played"])
+    campaign.read_count = sum(counts.get(s, 0) for s in ["read", "played"])
+    campaign.failed_count = counts.get("failed", 0)
+    campaign.skipped_count = counts.get("skipped", 0) + counts.get("invalid", 0) + counts.get("cancelled", 0)
+    outstanding = counts.get("queued", 0) + counts.get("processing", 0)
+    if finalize and not outstanding and campaign.status not in {Campaign.Status.CANCELLED, Campaign.Status.PAUSED, Campaign.Status.CHECKING}:
+        campaign.status = Campaign.Status.ERRORS if campaign.failed_count or campaign.skipped_count else Campaign.Status.COMPLETED
+        campaign.completed_at = timezone.now()
+        campaign.dispatch_task_id = ""
+    campaign.last_progress_at = timezone.now()
+    campaign.save()
+    return counts
+
+
 def queue_campaign_entries(campaign):
     selected = campaign.dataset.recipients.filter(selected=True).order_by("original_row_number")
     seen = set()
     entries = []
-    for recipient in selected:
+    existing = set(campaign.campaign_recipients.values_list("imported_recipient_id", flat=True))
+    for sequence, recipient in enumerate(selected, 1):
+        if recipient.id in existing:
+            entry = campaign.campaign_recipients.get(imported_recipient=recipient)
+            if entry.sequence_number is None:
+                entry.sequence_number = sequence
+                entry.save(update_fields=["sequence_number", "updated_at"])
+            seen.add(recipient.phone_normalized)
+            continue
         state, reason = CampaignRecipient.State.QUEUED, ""
         rendered, missing = render_message(campaign.body_snapshot, recipient.row_data, campaign.missing_value_policy, campaign.missing_value_fallback)
         if recipient.phone_validation_status not in {"valid", "warning"}:
@@ -113,40 +150,55 @@ def queue_campaign_entries(campaign):
         elif recipient.phone_normalized in seen and not campaign.allow_duplicates:
             state, reason = CampaignRecipient.State.SKIPPED, "Duplicate number"
         seen.add(recipient.phone_normalized)
-        entries.append(CampaignRecipient(campaign=campaign, imported_recipient=recipient, rendered_message=rendered or "", normalized_phone=recipient.phone_normalized, state=state, skip_reason=reason, queued_at=timezone.now()))
+        entries.append(CampaignRecipient(campaign=campaign, imported_recipient=recipient, rendered_message=rendered or "", normalized_phone=recipient.phone_normalized, state=state, skip_reason=reason, queued_at=timezone.now(), sequence_number=sequence))
     CampaignRecipient.objects.bulk_create(entries, ignore_conflicts=True)
-    campaign.total_count = len(entries)
-    campaign.selected_recipient_count = len(entries)
-    campaign.queued_count = sum(e.state == CampaignRecipient.State.QUEUED for e in entries)
-    campaign.skipped_count = sum(e.state in {CampaignRecipient.State.SKIPPED, CampaignRecipient.State.INVALID} for e in entries)
-    campaign.save()
+    campaign.selected_recipient_count = selected.count()
+    campaign.save(update_fields=["selected_recipient_count", "updated_at"])
+    counts = recalculate_campaign(campaign.id, finalize=False)
+    return {
+        "total": sum(counts.values()), "queued": counts.get("queued", 0),
+        "skipped": counts.get("skipped", 0), "invalid": counts.get("invalid", 0),
+    }
 
 
-@shared_task
-def dispatch_campaign(campaign_id):
-    campaign = Campaign.objects.get(pk=campaign_id)
-    if campaign.status in {Campaign.Status.CANCELLED, Campaign.Status.PAUSED}: return
-    if not campaign.campaign_recipients.exists():
-        queue_campaign_entries(campaign)
-    campaign.status = Campaign.Status.SENDING
-    campaign.started_at = campaign.started_at or timezone.now()
-    campaign.save(update_fields=["status", "started_at", "updated_at"])
-    interval = max(60 if settings.WASENDER_TRIAL_MODE else 0, settings.WASENDER_SEND_INTERVAL_SECONDS)
-    for index, entry_id in enumerate(campaign.campaign_recipients.filter(state=CampaignRecipient.State.QUEUED).values_list("id", flat=True)):
-        send_campaign_recipient.apply_async(args=[str(entry_id)], countdown=index * interval)
+def _release_owner_lock(key, token):
+    try:
+        client = cache._cache.get_client(write=True)
+        client.eval("if redis.call('get',KEYS[1])==ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end", 1, cache.make_key(key), token)
+    except Exception:
+        if cache.get(key) == token:
+            cache.delete(key)
 
 
-@shared_task(bind=True, max_retries=3)
-def send_campaign_recipient(self, entry_id):
+@shared_task(bind=True, acks_late=True, reject_on_worker_lost=True)
+def send_next_campaign_recipient(self, campaign_id, run_token):
+    owner_lock_key = None
+    owner_lock_token = uuid.uuid4().hex
     with transaction.atomic():
-        entry = CampaignRecipient.objects.select_for_update().select_related("campaign", "campaign__media").get(pk=entry_id)
-        campaign = entry.campaign
-        if campaign.status in {Campaign.Status.PAUSED, Campaign.Status.CANCELLED} or entry.state != CampaignRecipient.State.QUEUED:
+        campaign = Campaign.objects.select_for_update().select_related("media").get(pk=campaign_id)
+        if campaign.run_token != run_token or campaign.status in {Campaign.Status.PAUSED, Campaign.Status.CANCELLED}:
             return
-        lock_key = f"wasender-session-send:{campaign.owner_id}"
-        interval = max(60 if settings.WASENDER_TRIAL_MODE else 0, settings.WASENDER_SEND_INTERVAL_SECONDS)
-        if not cache.add(lock_key, "locked", timeout=max(1, interval)):
-            raise self.retry(countdown=max(1, interval), max_retries=None)
+        entry = campaign.campaign_recipients.select_for_update().filter(state=CampaignRecipient.State.QUEUED).order_by("sequence_number", "created_at").first()
+        if not entry:
+            recalculate_campaign(campaign.id)
+            return
+        owner_lock_key = f"wasender-session-send:{campaign.owner_id}"
+        if not cache.add(owner_lock_key, owner_lock_token, timeout=180):
+            result = send_next_campaign_recipient.apply_async(args=[str(campaign.id), run_token], countdown=10)
+            campaign.dispatch_task_id = result.id or ""
+            campaign.last_enqueued_at = timezone.now()
+            campaign.save(update_fields=["dispatch_task_id", "last_enqueued_at", "updated_at"])
+            return
+        now = timezone.now()
+        entry.state = CampaignRecipient.State.PROCESSING
+        entry.attempt_started_at = now
+        entry.attempt_finished_at = None
+        entry.scheduled_for = None
+        entry.save(update_fields=["state", "attempt_started_at", "attempt_finished_at", "scheduled_for", "updated_at"])
+        campaign.status = Campaign.Status.SENDING
+        campaign.started_at = campaign.started_at or now
+        campaign.last_progress_at = now
+        campaign.save(update_fields=["status", "started_at", "last_progress_at", "updated_at"])
         attempt_number = entry.attempts.count() + 1
         payload = {"to": entry.normalized_phone, "text": entry.rendered_message}
         attempt = MessageAttempt.objects.create(campaign_recipient=entry, attempt_number=attempt_number, request_payload=payload)
@@ -166,13 +218,13 @@ def send_campaign_recipient(self, entry_id):
         result = WasenderClient().send_message(entry.normalized_phone, entry.rendered_message, media_field, media_url)
         data = result.data.get("data", {})
         with transaction.atomic():
-            entry = CampaignRecipient.objects.select_for_update().get(pk=entry_id)
+            entry = CampaignRecipient.objects.select_for_update().get(pk=entry.id)
             entry.provider_message_id = str(data.get("msgId", ""))
             entry.provider_jid = str(data.get("jid", ""))
             entry.provider_status_text = str(data.get("status", "accepted"))
             entry.state = CampaignRecipient.State.ACCEPTED
             entry.last_provider_payload = result.data
-            entry.sent_at = timezone.now()
+            entry.attempt_finished_at = timezone.now()
             entry.save()
             attempt.http_status, attempt.provider_response = result.http_status, result.data
             attempt.provider_message_id = entry.provider_message_id
@@ -182,29 +234,68 @@ def send_campaign_recipient(self, entry_id):
         attempt.http_status, attempt.error_category, attempt.error_message = exc.status, exc.category, str(exc)
         attempt.provider_response, attempt.duration_ms = exc.payload, int((time.monotonic() - started) * 1000)
         attempt.save()
-        transient = exc.category in {"timeout", "connection", "rate_limit"} or (exc.status and exc.status >= 500)
-        if transient and self.request.retries < 3:
-            entry.retry_count += 1; entry.save(update_fields=["retry_count", "updated_at"])
-            raise self.retry(exc=exc, countdown=int(exc.retry_after or (2 ** self.request.retries * 30 + random.randint(0, 10))))
-        entry.state, entry.failed_at = CampaignRecipient.State.FAILED, timezone.now()
-        entry.save(update_fields=["state", "failed_at", "updated_at"])
-    refresh_campaign.delay(str(campaign.id))
+        transient = exc.category in {"timeout", "connection", "rate_limit"} or bool(exc.status and exc.status >= 500)
+        entry.refresh_from_db()
+        if transient and entry.retry_count < 3:
+            entry.retry_count += 1
+            entry.state = CampaignRecipient.State.QUEUED
+            entry.attempt_finished_at = timezone.now()
+            entry.save(update_fields=["retry_count", "state", "attempt_finished_at", "updated_at"])
+        else:
+            entry.state, entry.failed_at = CampaignRecipient.State.FAILED, timezone.now()
+            entry.attempt_finished_at = timezone.now()
+            entry.skip_reason = str(exc)[:255]
+            entry.save(update_fields=["state", "failed_at", "attempt_finished_at", "skip_reason", "updated_at"])
+    finally:
+        if owner_lock_key:
+            _release_owner_lock(owner_lock_key, owner_lock_token)
+    counts = recalculate_campaign(campaign.id, finalize=False)
+    if counts.get("queued", 0):
+        interval = max(60 if settings.WASENDER_TRIAL_MODE else 0, settings.WASENDER_SEND_INTERVAL_SECONDS)
+        scheduled = timezone.now() + timedelta(seconds=interval)
+        next_entry = campaign.campaign_recipients.filter(state="queued").order_by("sequence_number", "created_at").first()
+        if next_entry:
+            next_entry.scheduled_for = scheduled
+            next_entry.save(update_fields=["scheduled_for", "updated_at"])
+        result = send_next_campaign_recipient.apply_async(args=[str(campaign.id), run_token], countdown=interval)
+        Campaign.objects.filter(pk=campaign.id, run_token=run_token).update(dispatch_task_id=result.id or "", last_enqueued_at=timezone.now())
+    else:
+        recalculate_campaign(campaign.id)
+
+
+@shared_task
+def dispatch_campaign(campaign_id, run_token=None):
+    campaign = Campaign.objects.get(pk=campaign_id)
+    return send_next_campaign_recipient(str(campaign.id), run_token or campaign.run_token)
+
+
+@shared_task(bind=True, acks_late=True)
+def preflight_next_recipient(self, campaign_id, run_token):
+    with transaction.atomic():
+        campaign = Campaign.objects.select_for_update().get(pk=campaign_id)
+        if campaign.run_token != run_token or campaign.status != Campaign.Status.CHECKING:
+            return
+        recipient = campaign.dataset.recipients.select_for_update().filter(
+            selected=True, phone_validation_status__in=["valid", "warning"],
+            suppressed=False, whatsapp_state__in=["unknown", "error"]
+        ).order_by("original_row_number").first()
+        if not recipient:
+            campaign.status = Campaign.Status.READY
+            campaign.dispatch_task_id = ""
+            campaign.save(update_fields=["status", "dispatch_task_id", "updated_at"])
+            return
+        recipient.whatsapp_state = ImportedRecipient.WhatsApp.CHECKING
+        recipient.save(update_fields=["whatsapp_state", "updated_at"])
+    check_recipient(str(recipient.id))
+    result = preflight_next_recipient.apply_async(
+        args=[str(campaign.id), run_token], countdown=max(1, settings.WASENDER_CHECK_INTERVAL_SECONDS)
+    )
+    Campaign.objects.filter(pk=campaign.id, run_token=run_token).update(dispatch_task_id=result.id or "", last_enqueued_at=timezone.now())
 
 
 @shared_task
 def refresh_campaign(campaign_id):
-    campaign = Campaign.objects.get(pk=campaign_id)
-    counts = dict(campaign.campaign_recipients.values("state").annotate(n=Count("id")).values_list("state", "n"))
-    campaign.sent_count = sum(counts.get(s, 0) for s in ["accepted", "pending", "sent", "delivered", "read", "played"])
-    campaign.delivered_count = sum(counts.get(s, 0) for s in ["delivered", "read", "played"])
-    campaign.read_count = sum(counts.get(s, 0) for s in ["read", "played"])
-    campaign.failed_count = counts.get("failed", 0)
-    campaign.skipped_count = counts.get("skipped", 0) + counts.get("invalid", 0) + counts.get("cancelled", 0)
-    outstanding = counts.get("queued", 0) + counts.get("pending", 0)
-    if not outstanding and campaign.status not in {Campaign.Status.CANCELLED, Campaign.Status.PAUSED}:
-        campaign.status = Campaign.Status.ERRORS if campaign.failed_count or campaign.skipped_count else Campaign.Status.COMPLETED
-        campaign.completed_at = timezone.now()
-    campaign.save()
+    return recalculate_campaign(campaign_id)
 
 
 STATUS_MAP = {0: "failed", 1: "pending", 2: "sent", 3: "delivered", 4: "read", 5: "played"}
@@ -232,7 +323,7 @@ def process_webhook(event_id):
             if state in {"read", "played"}: entry.read_at = entry.read_at or now
             if state == "failed": entry.failed_at = entry.failed_at or now
             entry.save()
-            refresh_campaign.delay(str(entry.campaign_id))
+            recalculate_campaign(entry.campaign_id)
     event.processing_state, event.processed_at = "processed", timezone.now()
     event.save(update_fields=["processing_state", "processed_at", "updated_at"])
 
@@ -267,6 +358,6 @@ def reconcile_pending_messages():
                 entry.state, entry.provider_status_code = state, code
                 entry.last_provider_payload = result.data
                 entry.save()
-                refresh_campaign.delay(str(entry.campaign_id))
+                recalculate_campaign(entry.campaign_id)
         except (WasenderError, TypeError, ValueError):
             continue

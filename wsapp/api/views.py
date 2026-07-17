@@ -1,13 +1,18 @@
 import hashlib
 import hmac
 import json
+import uuid
+from datetime import timedelta
 from pathlib import Path
 
+from celery.exceptions import TimeoutError as CeleryTimeoutError
+from kombu.exceptions import OperationalError
+from redis.exceptions import ConnectionError as RedisConnectionError, TimeoutError as RedisTimeoutError
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import UploadedFile
-from django.db import transaction
+from django.db import models, transaction
 from django.db.models import Count, Q
 from django.http import Http404, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -18,19 +23,21 @@ from openpyxl import Workbook
 
 from .models import Campaign, CampaignRecipient, ImportedRecipient, MessageTemplate, UploadedDataset, UploadedMedia, WebhookEvent
 from .services.imports import checksum, workbook_sheets
+from .services.infrastructure import get_messaging_health
 from .services.phones import normalize_tanzania_phone
 from .services.templates import TemplateError, render_message, validate_template
 from .services.wasender import WasenderClient, WasenderError
-from .tasks import (check_recipient, dispatch_campaign, normalize_dataset, process_dataset,
-                    process_webhook, queue_campaign_entries, refresh_campaign, upload_media)
+from .tasks import (normalize_dataset, preflight_next_recipient, process_dataset,
+                    process_webhook, queue_campaign_entries, recalculate_campaign,
+                    send_next_campaign_recipient, upload_media)
 
 
 def ok(data=None, message=""):
     return JsonResponse({"ok": True, "message": message, "data": data or {}})
 
 
-def error(message, fields=None, status=400):
-    return JsonResponse({"ok": False, "message": message, "errors": fields or {}}, status=status)
+def error(message, fields=None, status=400, data=None):
+    return JsonResponse({"ok": False, "message": message, "errors": fields or {}, "data": data or {}}, status=status)
 
 
 def json_body(request):
@@ -272,46 +279,174 @@ def campaign_preview(request, campaign_id):
 
 
 @login_required
+@require_GET
+def messaging_health(request):
+    return ok({"health": get_messaging_health()})
+
+
+QUEUE_EXCEPTIONS = (OperationalError, RedisConnectionError, RedisTimeoutError, CeleryTimeoutError, ConnectionError, TimeoutError)
+
+
+def infrastructure_error(health, exc=None):
+    detail = str(exc)[:200] if exc else next(iter(health.get("errors", [])), health["message"])
+    return error(
+        health["message"], {"infrastructure": [detail]}, status=503,
+        data={"health": {k: health[k] for k in ("broker_ok", "cache_ok", "worker_ok", "ready")}},
+    )
+
+
+def enqueue_dispatcher(campaign, task, health):
+    token = uuid.uuid4().hex
+    now = timezone.now()
+    Campaign.objects.filter(pk=campaign.pk).update(run_token=token, queue_error="", dispatch_task_id="", last_enqueued_at=None)
+    try:
+        result = task.apply_async(args=[str(campaign.id), token])
+    except QUEUE_EXCEPTIONS as exc:
+        message = str(exc)[:500]
+        Campaign.objects.filter(pk=campaign.pk, run_token=token).update(
+            status=Campaign.Status.READY, dispatch_task_id="", queue_error=message, run_token="",
+        )
+        return None, infrastructure_error(health, exc)
+    Campaign.objects.filter(pk=campaign.pk, run_token=token).update(
+        status=Campaign.Status.QUEUED, dispatch_task_id=result.id or "", last_enqueued_at=now,
+        last_progress_at=now, queue_error="",
+    )
+    campaign.refresh_from_db()
+    return result, None
+
+
+@login_required
 @require_POST
 def campaign_preflight(request, campaign_id):
     campaign = get_object_or_404(Campaign, pk=campaign_id, owner=request.user)
-    eligible = campaign.dataset.recipients.filter(selected=True, phone_validation_status__in=["valid", "warning"]).exclude(suppressed=True)
-    limit = settings.WASENDER_MAX_CHECKS_PER_CAMPAIGN
-    interval = max(1, settings.WASENDER_CHECK_INTERVAL_SECONDS)
-    campaign.status = Campaign.Status.CHECKING; campaign.save(update_fields=["status", "updated_at"])
-    for index, rid in enumerate(eligible.values_list("id", flat=True)[:limit]):
-        check_recipient.apply_async(args=[str(rid)], countdown=index * interval)
-    return ok({"queued": min(eligible.count(), limit)})
+    health = get_messaging_health()
+    if not health["ready"]:
+        return infrastructure_error(health)
+    eligible = campaign.dataset.recipients.filter(
+        selected=True, phone_validation_status__in=["valid", "warning"], suppressed=False
+    )[:settings.WASENDER_MAX_CHECKS_PER_CAMPAIGN]
+    count = len(eligible)
+    if not count:
+        return error("No eligible recipients are available for preflight.")
+    campaign.status = Campaign.Status.CHECKING
+    campaign.save(update_fields=["status", "updated_at"])
+    result, response = enqueue_dispatcher(campaign, preflight_next_recipient, health)
+    if response:
+        return response
+    Campaign.objects.filter(pk=campaign.pk).update(status=Campaign.Status.CHECKING)
+    return ok({"queued": count, "task_id": result.id})
 
 
 @login_required
 @require_POST
 def campaign_action(request, campaign_id, action):
+    if action not in {"start", "pause", "resume", "cancel"}:
+        return error("Unknown campaign action.", status=400)
     campaign = get_object_or_404(Campaign, pk=campaign_id, owner=request.user)
     if action == "start":
-        if not campaign.opt_in_confirmed: return error("Recipient opt-in confirmation is required.")
-        if campaign.status in {"sending", "queued"}: return ok({"status": campaign.status}, "Campaign already queued.")
-        campaign.status = Campaign.Status.QUEUED; campaign.save(update_fields=["status", "updated_at"])
-        dispatch_campaign.delay(str(campaign.id))
+        if not campaign.opt_in_confirmed:
+            return error("Recipient opt-in confirmation is required.")
+        if not campaign.dataset.recipients.filter(selected=True).exists():
+            return error("Select at least one recipient before starting.")
+        if not settings.WASENDER_API_KEY:
+            return error("WhatsApp API key is not configured.", {"configuration": ["Set WASENDER_API_KEY."]})
+        active = campaign.status in {Campaign.Status.QUEUED, Campaign.Status.SENDING} and bool(campaign.dispatch_task_id)
+        recent = campaign.last_progress_at and campaign.last_progress_at > timezone.now() - timedelta(minutes=3)
+        if active and recent:
+            return ok(campaign_progress_data(campaign), "Campaign dispatcher is already active.")
+        health = get_messaging_health()
+        if not health["ready"]:
+            campaign.status = Campaign.Status.READY
+            campaign.queue_error = health["message"]
+            campaign.save(update_fields=["status", "queue_error", "updated_at"])
+            return infrastructure_error(health)
+        counts = queue_campaign_entries(campaign)
+        if not counts["queued"]:
+            return error("There are no sendable queued recipients.", {"recipients": ["Review skipped and invalid recipient reasons."]}, data={"counts": counts})
+        _, response = enqueue_dispatcher(campaign, send_next_campaign_recipient, health)
+        if response:
+            return response
+        return ok(campaign_progress_data(campaign), "Campaign queued.")
     elif action == "pause":
-        campaign.status = Campaign.Status.PAUSED; campaign.save(update_fields=["status", "updated_at"])
+        campaign.run_token = ""
+        campaign.dispatch_task_id = ""
+        campaign.status = Campaign.Status.PAUSED
+        campaign.save(update_fields=["run_token", "dispatch_task_id", "status", "updated_at"])
     elif action == "resume":
-        campaign.status = Campaign.Status.QUEUED; campaign.save(update_fields=["status", "updated_at"])
-        dispatch_campaign.delay(str(campaign.id))
+        if not campaign.campaign_recipients.filter(state="queued").exists():
+            return error("No unsent recipients remain to resume.")
+        health = get_messaging_health()
+        if not health["ready"]:
+            return infrastructure_error(health)
+        _, response = enqueue_dispatcher(campaign, send_next_campaign_recipient, health)
+        if response:
+            return response
     elif action == "cancel":
-        campaign.status = Campaign.Status.CANCELLED; campaign.save(update_fields=["status", "updated_at"])
+        campaign.run_token = ""
+        campaign.dispatch_task_id = ""
+        campaign.status = Campaign.Status.CANCELLED
+        campaign.save(update_fields=["run_token", "dispatch_task_id", "status", "updated_at"])
         campaign.campaign_recipients.filter(state="queued").update(state="cancelled")
-        refresh_campaign.delay(str(campaign.id))
+        recalculate_campaign(campaign.id, finalize=False)
     return ok({"status": campaign.status})
+
+
+def mask_phone(phone):
+    if len(phone) < 7:
+        return "***"
+    return f"{phone[:4]}***{phone[-4:]}"
+
+
+def campaign_progress_data(campaign):
+    recipients = campaign.campaign_recipients.select_related("imported_recipient")
+    states = dict(recipients.values("state").annotate(n=Count("id")).values_list("state", "n"))
+    total = sum(states.values())
+    sendable_total = total - states.get("skipped", 0) - states.get("invalid", 0)
+    terminal = {"accepted", "pending", "sent", "delivered", "read", "played", "failed", "skipped", "invalid", "cancelled"}
+    completed = sum(states.get(state, 0) for state in terminal)
+    attempted = recipients.filter(Q(attempt_started_at__isnull=False) | Q(attempts__isnull=False)).distinct().count()
+    processing = recipients.filter(state="processing").order_by("sequence_number").first()
+    scheduled = recipients.filter(state="queued", scheduled_for__isnull=False).order_by("scheduled_for").first()
+    now = timezone.now()
+    next_send_at = scheduled.scheduled_for if scheduled else None
+    seconds = max(0, int((next_send_at - now).total_seconds())) if next_send_at else None
+    stale = campaign.status in {"queued", "sending"} and campaign.last_progress_at and campaign.last_progress_at < now - timedelta(minutes=3)
+    health = get_messaging_health()
+    order = recipients.annotate(priority=models.Case(
+        models.When(state="processing", then=0), models.When(state="failed", then=1), default=2,
+        output_field=models.IntegerField(),
+    )).order_by("priority", "sequence_number", "-updated_at")[:100]
+    rows = [{
+        "id": str(r.id), "recipient_id": str(r.imported_recipient_id), "sequence": r.sequence_number,
+        "phone_masked": mask_phone(r.normalized_phone), "preview": r.rendered_message[:160],
+        "state": r.state, "state_label": r.get_state_display(), "error": r.skip_reason,
+        "attempts": r.attempts.count(), "updated_at": r.updated_at.isoformat(),
+    } for r in order]
+    accepted = states.get("accepted", 0) + states.get("pending", 0)
+    current = processing.sequence_number if processing else None
+    return {
+        "status": campaign.status, "status_label": campaign.get_status_display(), "total": total,
+        "sendable_total": sendable_total, "completed": completed, "attempted": attempted,
+        "current_number": current, "progress_text": f"{completed}/{sendable_total}",
+        "percent": round(completed / sendable_total * 100, 1) if sendable_total else 0,
+        "queued": states.get("queued", 0), "processing": states.get("processing", 0),
+        "accepted": accepted, "sent": states.get("sent", 0), "delivered": states.get("delivered", 0),
+        "read": states.get("read", 0) + states.get("played", 0), "failed": states.get("failed", 0),
+        "skipped": states.get("skipped", 0), "invalid": states.get("invalid", 0),
+        "cancelled": states.get("cancelled", 0), "next_send_at": next_send_at.isoformat() if next_send_at else None,
+        "seconds_until_next": seconds, "stalled": bool(stale), "queue_error": campaign.queue_error,
+        "health": {k: health[k] for k in ("broker_ok", "cache_ok", "worker_ok", "ready", "message")},
+        "recipients": rows,
+    }
 
 
 @login_required
 @require_GET
 def campaign_progress(request, campaign_id):
     campaign = get_object_or_404(Campaign, pk=campaign_id, owner=request.user)
-    states = dict(campaign.campaign_recipients.values("state").annotate(n=Count("id")).values_list("state", "n"))
-    preflight = dict(campaign.dataset.recipients.filter(selected=True).values("whatsapp_state").annotate(n=Count("id")).values_list("whatsapp_state", "n"))
-    return ok({"status": campaign.status, "total": campaign.total_count, "states": states, "preflight": preflight, "sent": campaign.sent_count, "delivered": campaign.delivered_count, "read": campaign.read_count, "failed": campaign.failed_count, "skipped": campaign.skipped_count})
+    response = ok(campaign_progress_data(campaign))
+    response["Cache-Control"] = "no-store"
+    return response
 
 
 @login_required
@@ -341,10 +476,40 @@ def message_action(request, entry_id, action):
 def resend_failed(request, campaign_id):
     campaign = get_object_or_404(Campaign, pk=campaign_id, owner=request.user)
     entries = campaign.campaign_recipients.filter(state="failed")
-    entries.update(state="queued")
-    campaign.status = Campaign.Status.QUEUED; campaign.save(update_fields=["status", "updated_at"])
-    dispatch_campaign.delay(str(campaign.id))
-    return ok({"queued": entries.count()})
+    count = entries.count()
+    if not count:
+        return error("No failed recipients are available to resend.")
+    health = get_messaging_health()
+    if not health["ready"]:
+        return infrastructure_error(health)
+    requeued = 0
+    for entry in entries.select_related("imported_recipient"):
+        source = entry.imported_recipient
+        rendered, missing = render_message(
+            campaign.body_snapshot, source.row_data, campaign.missing_value_policy, campaign.missing_value_fallback
+        )
+        if source.phone_validation_status not in {"valid", "warning"}:
+            entry.state = CampaignRecipient.State.INVALID
+            entry.skip_reason = source.validation_error_message or "Invalid corrected phone"
+        elif not rendered:
+            entry.state = CampaignRecipient.State.SKIPPED
+            entry.skip_reason = f"Missing values: {', '.join(missing)}"
+        else:
+            entry.state = CampaignRecipient.State.QUEUED
+            entry.normalized_phone = source.phone_normalized
+            entry.rendered_message = rendered
+            entry.skip_reason = ""
+            requeued += 1
+        entry.scheduled_for = entry.attempt_started_at = entry.attempt_finished_at = entry.failed_at = None
+        entry.save()
+    if not requeued:
+        recalculate_campaign(campaign.id)
+        return error("No corrected failed recipients are sendable.")
+    _, response = enqueue_dispatcher(campaign, send_next_campaign_recipient, health)
+    if response:
+        entries.filter(state="queued").update(state="failed")
+        return response
+    return ok({"queued": requeued}, f"{requeued} failed recipients requeued.")
 
 
 @login_required

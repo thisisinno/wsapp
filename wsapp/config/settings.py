@@ -25,7 +25,7 @@ MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
-    # "django.middleware.csrf.CsrfViewMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
@@ -86,12 +86,33 @@ LOGIN_URL = "login"
 LOGIN_REDIRECT_URL = "dashboard"
 LOGOUT_REDIRECT_URL = "login"
 
+APP_ASYNC_MODE = os.getenv("APP_ASYNC_MODE", "celery").strip().lower()
+if APP_ASYNC_MODE not in {"celery", "eager-dev"}:
+    raise ImproperlyConfigured("APP_ASYNC_MODE must be 'celery' or 'eager-dev'")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-CACHES = {"default": {"BACKEND": "django.core.cache.backends.redis.RedisCache", "LOCATION": REDIS_URL}}
-CELERY_BROKER_URL = REDIS_URL
-CELERY_RESULT_BACKEND = REDIS_URL
-CELERY_TASK_ALWAYS_EAGER = env_bool("CELERY_TASK_ALWAYS_EAGER", False)
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", REDIS_URL)
+_result_backend = os.getenv("CELERY_RESULT_BACKEND", "").strip()
+CELERY_RESULT_BACKEND = _result_backend or None
+CELERY_TASK_IGNORE_RESULT = True
+if APP_ASYNC_MODE == "eager-dev":
+    CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache", "LOCATION": "waya-eager-dev"}}
+    CELERY_TASK_ALWAYS_EAGER = True
+else:
+    CACHE_URL = os.getenv("CACHE_URL", "redis://localhost:6379/1")
+    CACHES = {"default": {"BACKEND": "django.core.cache.backends.redis.RedisCache", "LOCATION": CACHE_URL}}
+    CELERY_TASK_ALWAYS_EAGER = env_bool("CELERY_TASK_ALWAYS_EAGER", False)
 CELERY_TASK_EAGER_PROPAGATES = True
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_ENABLE_UTC = True
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_TASK_ACKS_LATE = True
+CELERY_TASK_REJECT_ON_WORKER_LOST = True
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+CELERY_TASK_SOFT_TIME_LIMIT = int(os.getenv("CELERY_TASK_SOFT_TIME_LIMIT", "90"))
+CELERY_TASK_TIME_LIMIT = int(os.getenv("CELERY_TASK_TIME_LIMIT", "120"))
 CELERY_BEAT_SCHEDULE = {
     "reconcile-pending-messages": {
         "task": "api.tasks.reconcile_pending_messages",

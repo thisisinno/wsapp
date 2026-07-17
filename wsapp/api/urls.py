@@ -17,6 +17,7 @@ urlpatterns = [
     path("campaigns/new/<uuid:dataset_id>/", views.campaign_new, name="campaign_new"),
     path("campaigns/create/<uuid:dataset_id>/", views.campaign_create, name="campaign_create"),
     path("media/new/", views.media_create, name="media_create"),
+    path("system/messaging-health/", views.messaging_health, name="messaging_health"),
     path("campaigns/<uuid:campaign_id>/", views.campaign_detail, name="campaign_detail"),
     path("campaigns/<uuid:campaign_id>/preview/", views.campaign_preview, name="campaign_preview"),
     path("campaigns/<uuid:campaign_id>/preflight/", views.campaign_preflight, name="campaign_preflight"),
