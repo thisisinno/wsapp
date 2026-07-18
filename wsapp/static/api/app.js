@@ -53,6 +53,29 @@ const Waya = (() => {
     bootstrap.Toast.getOrCreateInstance(node).show();
   }
 
+  function parseIntervalInput(input, { fallback = 0, allowBlank = true } = {}) {
+    const raw = String(input?.value ?? "").trim();
+
+    if (raw === "") {
+      return { valid: allowBlank, value: allowBlank ? Number(fallback) : null, blank: true, message: allowBlank ? "" : "Enter a whole number from 0 to 3600." };
+    }
+    if (!/^(0|[1-9]\d*)$/.test(raw)) {
+      return { valid: false, value: null, blank: false, message: "Enter a whole number from 0 to 3600." };
+    }
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < 0 || value > 3600) {
+      return { valid: false, value: null, blank: false, message: "Send interval must be between 0 and 3600 seconds." };
+    }
+    return { valid: true, value, blank: false, message: "" };
+  }
+
+  function setIntervalValidity(input, feedback, result) {
+    input.classList.toggle("is-invalid", !result.valid);
+    input.setCustomValidity(result.valid ? "" : result.message);
+    feedback.hidden = result.valid;
+    feedback.textContent = result.valid ? "" : result.message;
+  }
+
   function uploadForm() {
     document.querySelector("#uploadForm").addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -222,19 +245,35 @@ const Waya = (() => {
       body.dispatchEvent(new Event("input"));
     };
     const interval = document.querySelector("#sendInterval");
-    const validateInterval = () => {
-      const invalid = !/^\d+$/.test(interval.value) || Number(interval.value) > 3600;
-      interval.classList.toggle("is-invalid", invalid);
-      document.querySelectorAll(".campaign-interval").forEach((button) => button.classList.toggle("active", Number(button.dataset.value) === Number(interval.value)));
-      return !invalid;
+    const feedback = document.querySelector("#sendIntervalFeedback");
+    const initial = parseIntervalInput(interval, { allowBlank: true });
+    let selectedInterval = initial.valid ? initial.value : 0;
+    const updateInterval = () => {
+      const parsed = parseIntervalInput(interval, { fallback: selectedInterval, allowBlank: true });
+      setIntervalValidity(interval, feedback, parsed);
+      document.querySelectorAll(".campaign-interval").forEach((button) => button.classList.toggle("active", parsed.valid && !parsed.blank && Number(button.dataset.value) === parsed.value));
+      return parsed;
     };
-    document.querySelectorAll(".campaign-interval").forEach((button) => button.onclick = () => { interval.value = button.dataset.value; validateInterval(); });
-    interval.addEventListener("input", validateInterval); validateInterval();
+    document.querySelectorAll(".campaign-interval").forEach((button) => button.onclick = () => {
+      const value = Number(button.dataset.value);
+      interval.value = String(value);
+      selectedInterval = value;
+      updateInterval();
+    });
+    interval.addEventListener("input", updateInterval);
+    updateInterval();
     document.querySelector("#media").onchange = (event) => { const file = event.target.files[0]; document.querySelector("#mediaFeedback").textContent = file ? `${file.name} · ${file.type || "detected from file"} · ${Math.ceil(file.size / 1024)} KB` : ""; };
     document.querySelector("#campaignForm").onsubmit = async (event) => {
       event.preventDefault();
-      if (!validateInterval()) return;
-      event.submitter.disabled = true;
+      const parsed = updateInterval();
+      if (!parsed.valid) return;
+      if (!document.querySelector("#name").value.trim() || !body.value.trim() || !document.querySelector("#optin").checked) {
+        toast("Enter a campaign name and message, and confirm recipient opt-in.");
+        return;
+      }
+      const submitButton = event.submitter || event.currentTarget.querySelector('button[type="submit"]');
+      if (!submitButton || submitButton.disabled) return;
+      submitButton.disabled = true;
       try {
         let media_id = "";
         const file = document.querySelector("#media").files[0];
@@ -253,14 +292,19 @@ const Waya = (() => {
             missing_value_fallback: document.querySelector("#fallback").value,
             allow_unknown: document.querySelector("#unknown").checked,
             allow_duplicates: document.querySelector("#duplicates").checked,
-            send_interval_seconds: document.querySelector("#sendInterval").value,
+            send_interval_seconds: parsed.value,
             opt_in_confirmed: document.querySelector("#optin").checked,
           }),
         });
         location.href = data.url;
       } catch (error) {
+        const fields = error.payload?.fields || error.payload?.errors || {};
+        const intervalErrors = fields.send_interval_seconds;
+        if (intervalErrors?.length) {
+          setIntervalValidity(interval, feedback, { valid: false, message: intervalErrors[0] });
+        }
         toast(error.message);
-        event.submitter.disabled = false;
+        submitButton.disabled = false;
       }
     };
   }
@@ -785,9 +829,17 @@ const Waya = (() => {
 
   function messagingSettings() {
     const input = document.querySelector("#defaultInterval"), feedback = document.querySelector("#settingsFeedback");
-    const validate = () => { const invalid = !/^\d+$/.test(input.value) || Number(input.value) > 3600; input.classList.toggle("is-invalid", invalid); feedback.className = `small mt-2 ${invalid ? "text-danger" : ""}`; feedback.textContent = invalid ? "Send interval must be between 0 and 3600 seconds." : ""; document.querySelectorAll(".interval-preset").forEach((button) => button.classList.toggle("active", Number(button.dataset.value) === Number(input.value))); return !invalid; };
-    document.querySelectorAll(".interval-preset").forEach((button) => button.onclick = () => { input.value = button.dataset.value; validate(); }); input.addEventListener("input", validate); validate();
-    document.querySelector("#messagingSettingsForm").onsubmit = async (event) => { event.preventDefault(); if (!validate()) return; try { const data = await request("/settings/messaging/save/", {method:"POST", body:JSON.stringify({default_send_interval_seconds:input.value, auto_check_whatsapp_after_normalization:document.querySelector("#autoCheck").checked})}); feedback.className="small mt-2 text-success"; feedback.textContent=`Saved: ${data.default_send_interval_seconds} seconds.`; } catch (error) { feedback.className="small mt-2 text-danger"; feedback.textContent=error.message; } };
+    const initial = parseIntervalInput(input, { allowBlank: true });
+    let selectedInterval = initial.valid ? initial.value : 0;
+    const validate = () => {
+      const parsed = parseIntervalInput(input, { fallback: selectedInterval, allowBlank: true });
+      setIntervalValidity(input, feedback, parsed);
+      document.querySelectorAll(".interval-preset").forEach((button) => button.classList.toggle("active", parsed.valid && !parsed.blank && Number(button.dataset.value) === parsed.value));
+      return parsed;
+    };
+    document.querySelectorAll(".interval-preset").forEach((button) => button.onclick = () => { const value = Number(button.dataset.value); input.value = String(value); selectedInterval = value; validate(); });
+    input.addEventListener("input", validate); validate();
+    document.querySelector("#messagingSettingsForm").onsubmit = async (event) => { event.preventDefault(); const parsed = validate(); if (!parsed.valid) return; const button = event.submitter || event.currentTarget.querySelector('button[type="submit"]'); if (!button || button.disabled) return; button.disabled = true; try { const data = await request("/settings/messaging/save/", {method:"POST", body:JSON.stringify({default_send_interval_seconds:parsed.value, auto_check_whatsapp_after_normalization:document.querySelector("#autoCheck").checked})}); input.value = String(data.default_send_interval_seconds); selectedInterval = data.default_send_interval_seconds; feedback.className="small mt-2 text-success"; feedback.hidden=false; feedback.textContent=`Saved: ${data.default_send_interval_seconds} seconds.`; } catch (error) { const fields = error.payload?.fields || error.payload?.errors || {}; const errors = fields.default_send_interval_seconds; if (errors?.length) setIntervalValidity(input, feedback, {valid:false, message:errors[0]}); else { feedback.className="small mt-2 text-danger"; feedback.hidden=false; feedback.textContent=error.message; } } finally { button.disabled = false; } };
   }
   return { request, toast, uploadForm, dataset, campaignForm, campaign, messageLogs, messagingSettings };
 })();

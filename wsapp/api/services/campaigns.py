@@ -17,6 +17,30 @@ from api.services.wasender import WasenderClient, WasenderError, safe_provider_p
 logger = logging.getLogger(__name__)
 
 
+class SendIntervalError(ValueError):
+    """Raised when an untrusted send interval is invalid."""
+
+
+def parse_send_interval(raw_value, *, default=None, allow_blank=False):
+    """Parse a request interval without treating a valid zero as absent."""
+    if raw_value is None or str(raw_value).strip() == "":
+        if allow_blank:
+            if default is None:
+                return 0
+            raw_value = default
+        else:
+            raise SendIntervalError("Enter a whole number from 0 to 3600.")
+
+    text = str(raw_value).strip()
+    if not text.isdigit():
+        raise SendIntervalError("Enter a whole number from 0 to 3600.")
+
+    value = int(text)
+    if value < 0 or value > 3600:
+        raise SendIntervalError("Send interval must be between 0 and 3600 seconds.")
+    return value
+
+
 ATTEMPTED_STATES = {
     CampaignRecipient.State.ACCEPTED,
     CampaignRecipient.State.PENDING,

@@ -31,6 +31,8 @@ from .services.campaigns import (
     send_next,
     start_campaign,
     normalize_send_interval,
+    parse_send_interval,
+    SendIntervalError,
 )
 from .services.datasets import normalize_dataset, process_dataset
 from .services.media import upload_media
@@ -319,10 +321,11 @@ def messaging_settings(request):
 @require_POST
 def messaging_settings_save(request):
     data = json_body(request)
-    try: interval = int(data.get("default_send_interval_seconds"))
-    except (TypeError, ValueError): return error("Enter a whole number of seconds.", {"default_send_interval_seconds": ["Required."]})
-    if not 0 <= interval <= settings.WASENDER_MAX_SEND_INTERVAL_SECONDS: return error("Send interval must be between 0 and 3600 seconds.", {"default_send_interval_seconds": ["Out of range."]})
     preference = preference_for(request.user)
+    try:
+        interval = parse_send_interval(data.get("default_send_interval_seconds"), default=preference.default_send_interval_seconds, allow_blank=True)
+    except SendIntervalError as exc:
+        return error(str(exc), {"default_send_interval_seconds": [str(exc)]})
     preference.default_send_interval_seconds = interval
     preference.auto_check_whatsapp_after_normalization = bool(data.get("auto_check_whatsapp_after_normalization"))
     preference.save()
@@ -357,9 +360,11 @@ def campaign_create(request, dataset_id):
         media = get_object_or_404(UploadedMedia, pk=data["media_id"], owner=request.user)
         if media.upload_status != UploadedMedia.Status.READY:
             return error("Media upload must finish before creating a campaign.", {"media_id": ["Upload failed or is incomplete."]})
-    try: interval = int(data.get("send_interval_seconds", preference_for(request.user).default_send_interval_seconds))
-    except (TypeError, ValueError): return error("Enter a valid send interval.", {"send_interval_seconds": ["Required."]})
-    if not 0 <= interval <= settings.WASENDER_MAX_SEND_INTERVAL_SECONDS: return error("Send interval must be between 0 and 3600 seconds.", {"send_interval_seconds": ["Out of range."]})
+    preference = preference_for(request.user)
+    try:
+        interval = parse_send_interval(data.get("send_interval_seconds"), default=preference.default_send_interval_seconds, allow_blank=True)
+    except SendIntervalError as exc:
+        return error(str(exc), {"send_interval_seconds": [str(exc)]})
     campaign = Campaign.objects.create(owner=request.user, dataset=dataset, name=data.get("name", "Untitled campaign")[:150], body_snapshot=data.get("body", ""), selected_phone_column=dataset.selected_phone_column, send_interval_seconds=interval, missing_value_policy=data.get("missing_value_policy", "empty"), missing_value_fallback=data.get("missing_value_fallback", ""), allow_duplicates=bool(data.get("allow_duplicates")), allow_unknown=bool(data.get("allow_unknown")), opt_in_confirmed=True, media=media, status=Campaign.Status.READY, send_config_snapshot={"interval_seconds": interval, "placeholders": detected})
     return ok({"id": str(campaign.id), "url": f"/campaigns/{campaign.id}/"})
 

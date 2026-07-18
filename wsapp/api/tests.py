@@ -18,10 +18,11 @@ from .models import (
     CampaignRecipient,
     ImportedRecipient,
     MessageAttempt,
+    MessagingPreference,
     UploadedDataset,
     UploadedMedia,
 )
-from .services.campaigns import check_recipient, queue_campaign_entries
+from .services.campaigns import SendIntervalError, check_recipient, parse_send_interval, queue_campaign_entries
 from .services.imports import disambiguate_headers, parse_tabular
 from .services.phones import excel_value_to_text, normalize_tanzania_phone
 from .services.templates import TemplateError, render_message, validate_template
@@ -467,6 +468,85 @@ class CsrfAndFrontendTests(TestCase):
 
     def test_webhook_url_is_removed(self):
         self.assertEqual(self.client.post("/webhooks/wasender/").status_code, 404)
+
+
+class SendIntervalTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("interval", password="pw")
+        self.dataset = make_dataset(self.user)
+        self.client.force_login(self.user)
+        self.preference = MessagingPreference.objects.create(
+            owner=self.user, default_send_interval_seconds=30
+        )
+
+    def create(self, interval_marker=None):
+        payload = {"name": "Interval", "body": "Hello", "opt_in_confirmed": True}
+        if interval_marker is not None:
+            payload["send_interval_seconds"] = interval_marker
+        return self.client.post(
+            reverse("campaign_create", args=[self.dataset.id]),
+            data=json.dumps(payload), content_type="application/json",
+        )
+
+    def test_strict_parser_accepts_zero_and_one(self):
+        self.assertEqual(parse_send_interval("0"), 0)
+        self.assertEqual(parse_send_interval(0), 0)
+        self.assertEqual(parse_send_interval("1"), 1)
+
+    def test_strict_parser_rejects_invalid_values(self):
+        for value in ("-1", "1.5", "1e2", "words", "3601"):
+            with self.assertRaises(SendIntervalError):
+                parse_send_interval(value)
+
+    @patch("api.services.wasender.WasenderClient.send_message")
+    @patch("api.services.wasender.WasenderClient.check_number")
+    def test_campaign_interval_defaults_and_zero_are_preserved(self, check, send):
+        for value, expected in ((None, 30), ("", 30), (0, 0), ("0", 0)):
+            response = self.create(value)
+            self.assertEqual(response.status_code, 200)
+            campaign = Campaign.objects.get(pk=response.json()["data"]["id"])
+            self.assertEqual(campaign.send_interval_seconds, expected)
+            self.assertEqual(campaign.send_config_snapshot["interval_seconds"], expected)
+        self.assertFalse(check.called)
+        self.assertFalse(send.called)
+
+    def test_campaign_invalid_intervals_are_field_errors(self):
+        for value in ("-1", "1.5", "3601"):
+            response = self.create(value)
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("send_interval_seconds", response.json()["errors"])
+
+    def test_settings_zero_and_blank_preserve_values(self):
+        url = reverse("messaging_settings_save")
+        response = self.client.post(url, json.dumps({"default_send_interval_seconds": 0}), content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        self.preference.refresh_from_db()
+        self.assertEqual(self.preference.default_send_interval_seconds, 0)
+        self.preference.default_send_interval_seconds = 60
+        self.preference.save()
+        response = self.client.post(url, json.dumps({"default_send_interval_seconds": ""}), content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        self.preference.refresh_from_db()
+        self.assertEqual(self.preference.default_send_interval_seconds, 60)
+
+    def test_interval_templates_and_versioned_assets(self):
+        campaign = self.client.get(reverse("campaign_new", args=[self.dataset.id])).content.decode()
+        settings_page = self.client.get(reverse("messaging_settings")).content.decode()
+        base = (Path(settings.BASE_DIR) / "templates/base.html").read_text()
+        javascript = (Path(settings.BASE_DIR) / "static/api/app.js").read_text()
+        self.assertNotIn("required", campaign.split('id="sendInterval"', 1)[1].split(">", 1)[0])
+        self.assertNotIn("required", settings_page.split('id="defaultInterval"', 1)[1].split(">", 1)[0])
+        self.assertIn('min="0"', campaign)
+        self.assertIn('min="0"', settings_page)
+        self.assertNotIn("Custom seconds (5–3600)", settings_page)
+        self.assertNotIn("provider enforces a minimum of 5 seconds", settings_page)
+        self.assertIn("api/app.js' %}?v={{ STATIC_ASSET_VERSION }}", base)
+        self.assertIn("api/app.css' %}?v={{ STATIC_ASSET_VERSION }}", base)
+        self.assertIn("parseIntervalInput", javascript)
+        self.assertIn("^(0|[1-9]\\d*)$", javascript)
+        self.assertNotIn("interval.value ||", javascript)
+        self.assertNotIn("Number(interval.value) ||", javascript)
+        self.assertIn('id="sendIntervalFeedback" class="invalid-feedback" hidden', campaign)
 
 
 @override_settings(
