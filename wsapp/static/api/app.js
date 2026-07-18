@@ -223,7 +223,7 @@ const Waya = (() => {
     };
     const interval = document.querySelector("#sendInterval");
     const validateInterval = () => {
-      const invalid = Number(interval.value) < 5;
+      const invalid = !/^\d+$/.test(interval.value) || Number(interval.value) > 3600;
       interval.classList.toggle("is-invalid", invalid);
       document.querySelectorAll(".campaign-interval").forEach((button) => button.classList.toggle("active", Number(button.dataset.value) === Number(interval.value)));
       return !invalid;
@@ -265,7 +265,23 @@ const Waya = (() => {
     };
   }
 
-  function campaign(id) {
+  function setTextIfChanged(node, value) { const next = String(value ?? ""); if (node && node.textContent !== next) node.textContent = next; }
+  function createCampaignRecipientRow(data) {
+    const template = document.createElement("template");
+    template.innerHTML = `<tr id="message-${data.id}" data-message-id="${data.id}" data-serial="${data.sequence}" data-provider-message-id="${escapeHtml(data.provider_message_id || "")}" data-state="${escapeHtml(data.state)}" data-status-sync-eligible="${["accepted", "pending", "sent", "delivered"].includes(data.state) && data.provider_message_id && !data.is_deleted}"><td><input type="checkbox" class="message-check" aria-label="Select message"></td><td data-field="sequence">${data.sequence ?? "—"}</td><td data-field="phone">${escapeHtml(data.phone_masked)}</td><td><button class="btn btn-link p-0 text-start preview-cell" data-field="message-preview" data-message-action="detail">${escapeHtml(data.preview)}</button></td><td class="message-status-cell"><span data-field="status" class="app-status app-status--${escapeHtml(data.state)}">● ${escapeHtml(data.state_label)}</span></td><td data-field="reason" class="text-danger">${escapeHtml(data.error)}</td><td class="text-end message-actions"><button class="btn btn-sm btn-outline-secondary" data-message-action="detail">View</button><button class="btn btn-sm btn-outline-primary" data-message-action="refresh" ${!data.provider_message_id || data.is_deleted ? "disabled" : ""}>↻</button><button class="btn btn-sm btn-outline-secondary" data-message-action="update" ${data.is_deleted || (!data.provider_message_id && data.state !== "failed") ? "disabled" : ""}>Update</button><button class="btn btn-sm btn-outline-danger" data-message-action="delete" ${!data.provider_message_id || data.is_deleted ? "disabled" : ""}>Delete</button>${data.state === "failed" && !data.is_deleted ? '<button class="btn btn-sm btn-warning" data-message-action="resend">Resend</button>' : ""}</td></tr>`;
+    return template.content.firstElementChild;
+  }
+  function patchCampaignRecipientRow(row, data) {
+    if (!row) return;
+    row.dataset.state = data.state; row.dataset.providerMessageId = data.provider_message_id || "";
+    row.dataset.statusSyncEligible = String(["accepted", "pending", "sent", "delivered"].includes(data.state) && data.provider_message_id && !data.is_deleted);
+    setTextIfChanged(row.querySelector('[data-field="sequence"]'), data.sequence ?? "—");
+    setTextIfChanged(row.querySelector('[data-field="phone"]'), data.phone_masked);
+    setTextIfChanged(row.querySelector('[data-field="message-preview"]'), data.preview);
+    setTextIfChanged(row.querySelector('[data-field="reason"]'), data.error);
+    const badge = row.querySelector('[data-field="status"]'); if (badge) { const text = `● ${data.is_deleted ? "Deleted" : data.state_label}`; if (badge.textContent !== text) { badge.textContent = text; badge.className = `app-status app-status--${data.is_deleted ? "deleted" : data.state} status-badge-updated`; setTimeout(() => badge.classList.remove("status-badge-updated"), 200); } }
+  }
+  function campaign(id, options = {}) {
     const $ = (selector) => document.querySelector(selector);
     const tokenKey = `waya-campaign-run-${id}`;
     let runToken = sessionStorage.getItem(tokenKey) || "";
@@ -314,31 +330,19 @@ const Waya = (() => {
       } else if (data.latest_result && processed) {
         heading = `Processed ${data.progress_text} — ${data.latest_result.state}`;
       }
-      $("#campaignStatus").textContent = heading;
-      $("#progressText").textContent = `${data.progress_text} · ${data.percent}%`;
+      setTextIfChanged($("#campaignStatus"), heading);
+      setTextIfChanged($("#progressText"), `${data.progress_text} · ${data.percent}%`);
       const bar = $("#campaignProgressBar");
-      bar.style.width = `${data.percent}%`;
+      if (bar.style.width !== `${data.percent}%`) bar.style.width = `${data.percent}%`;
       bar.setAttribute("aria-valuenow", processed);
       bar.setAttribute("aria-valuemax", data.sendable_total || 1);
       ["sendable_total", "processed", "accepted", "sent", "delivered", "read", "failed", "remaining", "skipped", "invalid"].forEach((key) => {
-        $(`#${key}`).textContent = data[key];
+        setTextIfChanged($(`#${key}`), data[key]);
       });
       $("#providerAlert").classList.toggle("d-none", data.provider_configured !== false);
-      $("#recipientRows").innerHTML = data.recipients.map((row) => `
-        <tr id="message-${row.id}" data-message-id="${row.id}" data-serial="${row.sequence}" data-provider-message-id="${escapeHtml(row.provider_message_id || "")}" data-state="${escapeHtml(row.state)}" data-status-sync-eligible="${["accepted", "pending", "sent", "delivered"].includes(row.state) && row.provider_message_id && !row.is_deleted}" class="${row.state === "processing" || row.sequence === sendingSequence ? "table-primary" : ""}">
-          <td><input type="checkbox" class="message-check" aria-label="Select message"></td><td>${row.sequence ?? "—"}</td>
-          <td>${escapeHtml(row.phone_masked)}</td>
-          <td><button class="btn btn-link p-0 text-start preview-cell" data-message-action="detail">${escapeHtml(row.preview)}</button></td>
-          <td><span class="app-status app-status--${row.is_deleted ? "deleted" : escapeHtml(row.state)}">● ${row.is_deleted ? "Deleted" : escapeHtml(row.state_label)}</span></td>
-          <td class="text-danger">${escapeHtml(row.error)}</td>
-          <td class="text-end message-actions">
-            <button class="btn btn-sm btn-outline-secondary" data-message-action="detail">View</button>
-            <button class="btn btn-sm btn-outline-primary" data-message-action="refresh" ${!row.provider_message_id || row.is_deleted ? "disabled" : ""}>↻</button>
-            <button class="btn btn-sm btn-outline-secondary" data-message-action="update" ${row.is_deleted || (!row.provider_message_id && row.state !== "failed") ? "disabled" : ""}>Update</button>
-            <button class="btn btn-sm btn-outline-danger" data-message-action="delete" ${!row.provider_message_id || row.is_deleted ? "disabled" : ""}>Delete</button>
-            ${row.state === "failed" && !row.is_deleted ? '<button class="btn btn-sm btn-warning" data-message-action="resend">Resend</button>' : ""}
-          </td>
-        </tr>`).join("") || '<tr><td colspan="7" class="empty">No campaign recipients yet.</td></tr>';
+      const body = $("#recipientRows"), seen = new Set();
+      data.recipients.forEach((row) => { seen.add(row.id); let node = body.querySelector(`#message-${CSS.escape(row.id)}`); if (!node) { node = createCampaignRecipientRow(row); body.appendChild(node); } patchCampaignRecipientRow(node, row); node.classList.toggle("table-primary", row.state === "processing" || row.sequence === sendingSequence); });
+      [...body.querySelectorAll("[data-message-id]")].forEach((node) => { if (!seen.has(node.dataset.messageId)) node.remove(); });
       $('[data-action="start"]').disabled = !data.can_start;
       $('[data-action="resume"]').disabled = !data.can_resume;
       $('[data-action="pause"]').disabled = !data.can_pause;
@@ -355,7 +359,7 @@ const Waya = (() => {
         render(data);
         const protection = $("#providerProtection");
         if (protection) protection.classList.toggle("d-none", !data.rate_limited);
-        if (data.rate_limited) toast("Provider protection paused sending for 5 seconds. Sending will resume automatically.");
+        if (data.rate_limited && protection) { protection.textContent = data.message || `The provider requested a ${data.wait_seconds}-second pause. Sending will resume automatically.`; }
         $("#liveDisconnect").classList.add("d-none");
         return data;
       } catch (error) {
@@ -471,10 +475,6 @@ const Waya = (() => {
       const button = event.target.closest("[data-action]");
       if (button) action(button.dataset.action, button);
     });
-    document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) progress();
-    });
-    progress();
     const scheduleProgress = () => {
       clearTimeout(pollTimer);
       if (document.hidden) return;
@@ -483,9 +483,12 @@ const Waya = (() => {
       const delay = active ? 2500 : deliveryPending ? 5000 : 30000;
       pollTimer = setTimeout(async () => { await progress(); scheduleProgress(); }, delay);
     };
+    let progressInFlight = false;
+    const originalProgress = progress;
+    progress = async function () { if (progressInFlight) return lastProgress; progressInFlight = true; try { return await originalProgress(); } finally { progressInFlight = false; } };
     document.addEventListener("visibilitychange", () => { if (!document.hidden) { progress().then(scheduleProgress); } else clearTimeout(pollTimer); });
     window.addEventListener("pagehide", () => clearTimeout(pollTimer), { once: true });
-    progress().then(scheduleProgress);
+    progress().then(() => { if (options.enableMessageLogActions) messageLogs("#recipientRows", {campaignId: id}); scheduleProgress(); });
   }
 
   function escapeHtml(value) {
@@ -548,10 +551,19 @@ const Waya = (() => {
       setTimeout(() => row.classList.remove("message-row-updated"), 1400);
     }
 
+    function patchMessageStatus(row, patch) {
+      if (!row || !patch) return;
+      row.dataset.state = patch.state;
+      row.dataset.statusSyncEligible = String(Boolean(patch.status_sync_eligible));
+      const badge = row.querySelector(".app-status, [data-field=\"status\"]");
+      if (badge) { const text = `● ${patch.state_label}`; if (badge.textContent !== text) { badge.textContent = text; badge.className = `app-status app-status--${patch.state} status-badge-updated`; setTimeout(() => badge.classList.remove("status-badge-updated"), 200); } }
+      if (activeRow === row && document.querySelector("#messageDetailModal")?.classList.contains("show")) patchDetailStatus(patch);
+    }
+
     function syncStatus(text, checking = false) {
       if (!liveIndicator) return;
-      liveIndicator.textContent = `● Live status sync · ${text}`;
-      liveIndicator.classList.toggle("is-checking", checking);
+      const stamp = liveIndicator.querySelector("[data-live-time]");
+      if (stamp) setTextIfChanged(stamp, text ? ` · Last checked ${text}` : "");
     }
     function eligibleRows() {
       return [...rows.querySelectorAll("[data-message-id]")].filter((row) =>
@@ -566,30 +578,21 @@ const Waya = (() => {
     async function sync() {
       if (syncInFlight || document.hidden || !navigator.onLine) return;
       const eligible = eligibleRows();
-      if (!eligible.length) { syncStatus("Up to date"); scheduleSync(); return; }
+      if (!eligible.length) { scheduleSync(); return; }
       const selected = [];
       for (let index = 0; index < Math.min(5, eligible.length); index += 1) selected.push(eligible[(syncCursor + index) % eligible.length]);
       syncCursor = (syncCursor + selected.length) % eligible.length;
-      syncInFlight = true; syncStatus("Checking…", true);
+      syncInFlight = true;
       try {
         const data = await request("/messages/auto-sync-statuses/", { method: "POST", body: JSON.stringify({ ids: selected.map((row) => row.dataset.messageId), campaign_id: options.campaignId || undefined, limit: 5, serial_numbers: Object.fromEntries(selected.map((row) => [row.dataset.messageId, Number(row.dataset.serial)])) }) });
-        let updates = 0;
-        data.results.forEach((result) => {
-          const row = document.querySelector(`#message-${CSS.escape(result.id)}`);
-          if (row && result.row) {
-            if (result.changed) updates += 1;
-            renderRow(row, result.row);
-            if (activeRow === row && document.querySelector("#messageDetailModal")?.classList.contains("show")) loadDetail(row);
-          }
-        });
+        const patches = data.results.filter((result) => result.changed && result.patch);
+        requestAnimationFrame(() => patches.forEach((result) => patchMessageStatus(rows.querySelector(`#message-${CSS.escape(result.id)}`), result.patch)));
         if (data.auth_failed) {
-          syncStatus("Provider temporarily unavailable");
           if (!authWarned) { toast("Live delivery status is temporarily unavailable because provider authentication failed."); authWarned = true; }
           return;
         }
-        syncStatus(updates ? "Updated just now" : "Up to date");
-        if (updates) toast(`${updates} message status${updates === 1 ? "" : "es"} updated.`);
-      } catch (_) { syncStatus("Provider temporarily unavailable"); }
+        syncStatus(new Date().toLocaleTimeString());
+      } catch (_) { /* transient polling failures remain quiet */ }
       finally { syncInFlight = false; scheduleSync(); }
     }
 
@@ -614,10 +617,10 @@ const Waya = (() => {
           <dt class="col-sm-4">Campaign</dt><dd class="col-sm-8">${escapeHtml(data.campaign_name)}</dd>
           <dt class="col-sm-4">Original Excel row</dt><dd class="col-sm-8">${escapeHtml(data.original_row_number)}</dd>
           <dt class="col-sm-4">Phone</dt><dd class="col-sm-8">${escapeHtml(data.phone)} <button class="btn btn-sm btn-link copy-phone" data-phone="${escapeHtml(data.phone)}">Copy</button></dd>
-          <dt class="col-sm-4">Status</dt><dd class="col-sm-8"><span class="badge state-${escapeHtml(data.state)}">${statusIcon(data.state)} ${escapeHtml(data.state_label)}</span> · ${escapeHtml(data.delivery_explanation)}</dd>
+          <dt class="col-sm-4">Status</dt><dd class="col-sm-8"><span data-detail-field="state" class="badge state-${escapeHtml(data.state)}">${statusIcon(data.state)} ${escapeHtml(data.state_label)}</span> · <span data-detail-field="explanation">${escapeHtml(data.delivery_explanation)}</span></dd>
           <dt class="col-sm-4">Provider message ID</dt><dd class="col-sm-8 text-break">${escapeHtml(data.provider_message_id || "Not assigned")}</dd>
           <dt class="col-sm-4">Message</dt><dd class="col-sm-8 message-full">${escapeHtml(data.message)}</dd>
-          <dt class="col-sm-4">Sent / delivered / read</dt><dd class="col-sm-8">${escapeHtml(formatDate(data.sent_at))} / ${escapeHtml(formatDate(data.delivered_at))} / ${escapeHtml(formatDate(data.read_at))}</dd>
+          <dt class="col-sm-4">Sent / delivered / read</dt><dd class="col-sm-8"><span data-detail-field="timestamps">${escapeHtml(formatDate(data.sent_at))} / ${escapeHtml(formatDate(data.delivered_at))} / ${escapeHtml(formatDate(data.read_at))}</span></dd>
           <dt class="col-sm-4">Edited / deleted</dt><dd class="col-sm-8">${escapeHtml(formatDate(data.edited_at))} / ${escapeHtml(formatDate(data.deleted_at))}</dd>
           <dt class="col-sm-4">Last checked</dt><dd class="col-sm-8">${escapeHtml(formatDate(data.provider_status_checked_at))}</dd>
           <dt class="col-sm-4">Retries</dt><dd class="col-sm-8">${escapeHtml(data.retry_count)}</dd>
@@ -625,6 +628,13 @@ const Waya = (() => {
         ${data.failure_reason ? `<div class="alert alert-danger"><strong>Failure reason</strong><br>${escapeHtml(data.failure_reason)}</div>` : ""}
         <h3 class="h6 mt-4">Attempts</h3>${attempts}`;
       return data;
+    }
+
+    function patchDetailStatus(patch) {
+      const root = document.querySelector("#messageDetailBody"); if (!root) return;
+      const badge = root.querySelector('[data-detail-field="state"]'); if (badge) { badge.className = `badge state-${patch.state}`; setTextIfChanged(badge, `${statusIcon(patch.state)} ${patch.state_label}`); }
+      setTextIfChanged(root.querySelector('[data-detail-field="explanation"]'), patch.delivery_explanation);
+      setTextIfChanged(root.querySelector('[data-detail-field="timestamps"]'), `${formatDate(patch.sent_at)} / ${formatDate(patch.delivered_at)} / ${formatDate(patch.read_at)}`);
     }
 
     async function postAction(row, action, body = {}) {
@@ -775,7 +785,7 @@ const Waya = (() => {
 
   function messagingSettings() {
     const input = document.querySelector("#defaultInterval"), feedback = document.querySelector("#settingsFeedback");
-    const validate = () => { const invalid = Number(input.value) < 5; input.classList.toggle("is-invalid", invalid); feedback.className = `small mt-2 ${invalid ? "text-danger" : ""}`; feedback.textContent = invalid ? "Minimum allowed interval is 5 seconds because account protection is enabled." : ""; document.querySelectorAll(".interval-preset").forEach((button) => button.classList.toggle("active", Number(button.dataset.value) === Number(input.value))); return !invalid; };
+    const validate = () => { const invalid = !/^\d+$/.test(input.value) || Number(input.value) > 3600; input.classList.toggle("is-invalid", invalid); feedback.className = `small mt-2 ${invalid ? "text-danger" : ""}`; feedback.textContent = invalid ? "Send interval must be between 0 and 3600 seconds." : ""; document.querySelectorAll(".interval-preset").forEach((button) => button.classList.toggle("active", Number(button.dataset.value) === Number(input.value))); return !invalid; };
     document.querySelectorAll(".interval-preset").forEach((button) => button.onclick = () => { input.value = button.dataset.value; validate(); }); input.addEventListener("input", validate); validate();
     document.querySelector("#messagingSettingsForm").onsubmit = async (event) => { event.preventDefault(); if (!validate()) return; try { const data = await request("/settings/messaging/save/", {method:"POST", body:JSON.stringify({default_send_interval_seconds:input.value, auto_check_whatsapp_after_normalization:document.querySelector("#autoCheck").checked})}); feedback.className="small mt-2 text-success"; feedback.textContent=`Saved: ${data.default_send_interval_seconds} seconds.`; } catch (error) { feedback.className="small mt-2 text-danger"; feedback.textContent=error.message; } };
   }

@@ -32,13 +32,17 @@ SENDABLE_STATES = ATTEMPTED_STATES | {
 }
 
 
-def campaign_interval_seconds(campaign):
-    """The only send cadence policy, including malformed legacy values."""
+def normalize_send_interval(value, default=1):
+    """Clamp configuration without changing valid user choices, including zero."""
     try:
-        value = int(campaign.send_interval_seconds)
+        value = int(value)
     except (TypeError, ValueError):
-        value = settings.WASENDER_MIN_SEND_INTERVAL_SECONDS
-    return max(settings.WASENDER_MIN_SEND_INTERVAL_SECONDS, min(value, 3600))
+        value = default
+    return max(settings.WASENDER_MIN_SEND_INTERVAL_SECONDS, min(value, settings.WASENDER_MAX_SEND_INTERVAL_SECONDS))
+
+
+def campaign_interval_seconds(campaign):
+    return normalize_send_interval(campaign.send_interval_seconds, settings.WASENDER_SEND_INTERVAL_SECONDS)
 
 
 def provider_rate_limited(exc):
@@ -49,17 +53,30 @@ def provider_rate_limited(exc):
     return (
         getattr(exc, "status", None) == 429
         or "rate" in category and "limit" in category
-        or "only send 1 message every 5 seconds" in message
+        or ("rate" in message and ("limit" in message or "protect" in message))
         or "account protection enabled" in message
     )
 
 
-def provider_retry_seconds(exc):
-    try:
-        retry = int(getattr(exc, "retry_after", None) or (getattr(exc, "payload", {}) or {}).get("retry_after") or 0)
-    except (TypeError, ValueError):
-        retry = 0
-    return max(settings.WASENDER_MIN_SEND_INTERVAL_SECONDS, retry)
+def provider_retry_seconds(exc, campaign_interval=1):
+    payload = getattr(exc, "payload", {}) or {}
+    values = [getattr(exc, "retry_after", None)] + [payload.get(key) for key in ("retry_after", "retryAfter", "wait_seconds")]
+    message = safe_provider_text(exc).lower()
+    import re
+    match = re.search(r"(?:wait\s+|every\s+)(\d+)\s*seconds?", message)
+    if match:
+        values.append(match.group(1))
+    match = re.search(r"every\s+\d+\s+message(?:s)?\s+(?:every\s+)?(\d+)\s*seconds?", message)
+    if match:
+        values.append(match.group(1))
+    for value in values:
+        try:
+            retry = int(value)
+        except (TypeError, ValueError):
+            continue
+        if retry >= 0:
+            return retry
+    return max(campaign_interval, 1)
 
 
 def recalculate_campaign(campaign_id, finalize=True):
@@ -305,8 +322,9 @@ def send_next(campaign_id, owner_id, run_token):
             .order_by("-campaign_recipient__attempt_started_at")
             .first()
         )
-        if latest:
-            next_allowed = latest.campaign_recipient.attempt_started_at + timedelta(seconds=campaign_interval_seconds(campaign))
+        interval = campaign_interval_seconds(campaign)
+        if latest and interval:
+            next_allowed = latest.campaign_recipient.attempt_started_at + timedelta(seconds=interval)
             if next_allowed > now:
                 return {
                     "wait_seconds": max(
@@ -377,12 +395,12 @@ def send_next(campaign_id, owner_id, run_token):
         with transaction.atomic():
             locked = CampaignRecipient.objects.select_for_update().get(pk=entry.pk)
             is_rate_limited = provider_rate_limited(exc)
-            retry_seconds = provider_retry_seconds(exc) if is_rate_limited else 0
+            retry_seconds = provider_retry_seconds(exc, campaign_interval_seconds(campaign)) if is_rate_limited else 0
             locked.state = CampaignRecipient.State.QUEUED if is_rate_limited else CampaignRecipient.State.FAILED
             locked.failed_at = None if is_rate_limited else timezone.now()
             locked.attempt_finished_at = timezone.now()
             locked.scheduled_for = timezone.now() + timedelta(seconds=retry_seconds) if is_rate_limited else None
-            locked.skip_reason = "Provider protection requires a 5-second delay." if is_rate_limited else safe_provider_text(exc)[:255]
+            locked.skip_reason = f"The provider requested a {retry_seconds}-second pause." if is_rate_limited else safe_provider_text(exc)[:255]
             locked.save()
             attempt.http_status = exc.status
             attempt.provider_response = _safe_provider_payload(exc.payload)
@@ -428,10 +446,7 @@ def send_next(campaign_id, owner_id, run_token):
                     scheduled_for = next_entry.scheduled_for
                 next_entry.scheduled_for = scheduled_for
                 next_entry.save(update_fields=["scheduled_for", "updated_at"])
-                wait_seconds = max(
-                    settings.WASENDER_MIN_SEND_INTERVAL_SECONDS,
-                    int((scheduled_for - timezone.now()).total_seconds() + 0.999),
-                )
+                wait_seconds = max(0, int((scheduled_for - timezone.now()).total_seconds() + 0.999))
             else:
                 recalculate_campaign(campaign.id, finalize=True)
     response = {
@@ -444,8 +459,8 @@ def send_next(campaign_id, owner_id, run_token):
     if result_name == "rate_limited":
         response.update({
             "rate_limited": True,
-            "wait_seconds": max(wait_seconds, settings.WASENDER_MIN_SEND_INTERVAL_SECONDS),
-            "message": "Provider protection requires a 5-second delay.",
+            "wait_seconds": wait_seconds,
+            "message": f"The provider requested a {wait_seconds}-second pause.",
         })
     return response
 

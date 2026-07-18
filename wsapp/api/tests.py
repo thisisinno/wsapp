@@ -734,7 +734,7 @@ class MessageLogTests(TestCase):
         self.assertEqual(Campaign.objects.filter(owner=self.user).count(), 1)
 
     @patch("api.views.WasenderClient.message_info")
-    def test_auto_sync_advances_and_returns_compact_row(self, info):
+    def test_auto_sync_advances_and_returns_compact_patch(self, info):
         self.entry.state = "sent"
         self.entry.save()
         info.return_value = ProviderResult({"success": True, "data": {"status": 3}}, 200)
@@ -743,7 +743,8 @@ class MessageLogTests(TestCase):
         self.assertEqual(response["Cache-Control"], "no-store")
         result = response.json()["data"]["results"][0]
         self.assertTrue(result["changed"])
-        self.assertEqual(result["row"]["state"], "delivered")
+        self.assertEqual(result["patch"]["state"], "delivered")
+        self.assertNotIn("row", result)
         self.assertIn("campaign_counts", response.json()["data"])
         self.entry.refresh_from_db()
         self.assertIsNotNone(self.entry.delivered_at)

@@ -91,6 +91,8 @@ def apply_provider_status(entry, provider_payload, checked_at=None):
     raw_code, raw_text = provider_status_values(provider_payload)
     normalized = normalize_message_status(raw_code, raw_text)
     old_state = entry.state
+    old_visible = (entry.state, entry.sent_at, entry.delivered_at, entry.read_at, entry.failed_at,
+                   entry.provider_status_code, entry.provider_status_text)
     old_level = ACK_LEVELS.get(old_state, -1)
     new_level = ACK_LEVELS.get(normalized, -1)
     try:
@@ -120,10 +122,20 @@ def apply_provider_status(entry, provider_payload, checked_at=None):
         now + timedelta(seconds=status_sync_delay(entry.state))
         if entry.state in STATUS_SYNC_ELIGIBLE_STATES and not entry.provider_deleted_at else None
     )
-    entry.save()
+    changed = old_visible != (entry.state, entry.sent_at, entry.delivered_at, entry.read_at, entry.failed_at,
+                              entry.provider_status_code, entry.provider_status_text)
+    # Include state/timestamps for callers that set acceptance immediately before
+    # applying the provider acknowledgement, but retain updated_at for genuine
+    # visible changes only.
+    fields = ["state", "sent_at", "delivered_at", "read_at", "failed_at",
+              "provider_status_code", "provider_status_text", "provider_status_checked_at",
+              "last_provider_payload", "status_sync_failure_count", "status_sync_error", "next_status_check_at"]
+    if changed:
+        fields.append("updated_at")
+    entry.save(update_fields=fields)
     if entry.state != old_state:
         recalculate_campaign(entry.campaign_id, finalize=False)
-    return entry, entry.state != old_state
+    return entry, changed
 
 
 def record_status_sync_error(entry, exc, checked_at=None):
@@ -138,7 +150,7 @@ def record_status_sync_error(entry, exc, checked_at=None):
     delay = min(60, delay * max(1, min(entry.status_sync_failure_count, 2)))
     entry.provider_status_checked_at = now
     entry.next_status_check_at = now + timedelta(seconds=delay)
-    entry.save(update_fields=["status_sync_failure_count", "status_sync_error", "provider_status_checked_at", "next_status_check_at", "updated_at"])
+    entry.save(update_fields=["status_sync_failure_count", "status_sync_error", "provider_status_checked_at", "next_status_check_at"])
 
 
 def refresh_status(entry, client=None):
@@ -242,8 +254,9 @@ def resend_message(entry_id, owner_id, data, client=None):
             .first()
         )
         now = timezone.now()
-        if latest:
-            next_allowed = latest.campaign_recipient.attempt_started_at + timedelta(seconds=campaign_interval_seconds(entry.campaign))
+        interval = campaign_interval_seconds(entry.campaign)
+        if latest and interval:
+            next_allowed = latest.campaign_recipient.attempt_started_at + timedelta(seconds=interval)
             if next_allowed > now:
                 wait = max(1, math.ceil((next_allowed - now).total_seconds()))
                 raise MessageActionError(

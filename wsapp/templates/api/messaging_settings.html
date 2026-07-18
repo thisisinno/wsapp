@@ -1,14 +1,14 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="page-head"><div><h1>Messaging settings</h1><p>Your provider currently enforces at least 5 seconds between messages.</p></div></div>
+<div class="page-head"><div><h1>Messaging settings</h1><p>Choose how long to wait before sending the next message.</p></div></div>
 <form id="messagingSettingsForm" class="card p-4" style="max-width:680px">
   <h2 class="h5">Default delay between messages</h2>
   <div class="d-flex flex-wrap gap-2 mb-3">
     {% for value in "5,10,15,30,60"|make_list %}{% endfor %}
-    <button type="button" class="btn btn-outline-secondary interval-preset" data-value="5">5 sec</button><button type="button" class="btn btn-outline-secondary interval-preset" data-value="10">10 sec</button><button type="button" class="btn btn-outline-secondary interval-preset" data-value="15">15 sec</button><button type="button" class="btn btn-outline-secondary interval-preset" data-value="30">30 sec</button><button type="button" class="btn btn-outline-secondary interval-preset" data-value="60">60 sec</button>
+    <button type="button" class="btn btn-outline-secondary interval-preset" data-value="0">Immediate</button><button type="button" class="btn btn-outline-secondary interval-preset" data-value="1">1 sec</button><button type="button" class="btn btn-outline-secondary interval-preset" data-value="2">2 sec</button><button type="button" class="btn btn-outline-secondary interval-preset" data-value="5">5 sec</button><button type="button" class="btn btn-outline-secondary interval-preset" data-value="10">10 sec</button><button type="button" class="btn btn-outline-secondary interval-preset" data-value="30">30 sec</button><button type="button" class="btn btn-outline-secondary interval-preset" data-value="60">60 sec</button>
   </div>
   <label class="form-label" for="defaultInterval">Custom seconds (5–3600)</label>
-  <input id="defaultInterval" type="number" min="5" max="3600" class="form-control" value="{{ preference.default_send_interval_seconds }}">
+  <label class="form-label" for="defaultInterval">Custom seconds (0–3600)</label><input id="defaultInterval" type="number" min="0" max="3600" class="form-control" value="{{ preference.default_send_interval_seconds }}"><small class="text-muted">Zero means no added delay; messages are still sent sequentially.</small>
   <div id="settingsFeedback" class="small mt-2" role="status"></div><small class="text-muted">The provider enforces a minimum of 5 seconds between messages.</small>
   <div class="form-check mt-3"><input id="autoCheck" class="form-check-input" type="checkbox" {% if preference.auto_check_whatsapp_after_normalization %}checked{% endif %}><label class="form-check-label" for="autoCheck">Automatically check whether valid numbers are on WhatsApp after normalization</label></div>
   <button class="btn btn-purple mt-3">Save settings</button>

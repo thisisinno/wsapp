@@ -42,7 +42,7 @@ class UploadedDataset(UUIDTimeModel):
 
 class MessagingPreference(UUIDTimeModel):
     owner = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="messaging_preference")
-    default_send_interval_seconds = models.PositiveIntegerField(default=5, validators=[MinValueValidator(5), MaxValueValidator(3600)])
+    default_send_interval_seconds = models.PositiveIntegerField(default=1, validators=[MinValueValidator(0), MaxValueValidator(3600)])
     auto_check_whatsapp_after_normalization = models.BooleanField(default=True)
 
 
@@ -121,7 +121,7 @@ class Campaign(UUIDTimeModel):
     body_snapshot = models.TextField()
     selected_phone_column = models.CharField(max_length=255)
     selected_recipient_count = models.PositiveIntegerField(default=0)
-    send_interval_seconds = models.PositiveIntegerField(default=5, validators=[MinValueValidator(5), MaxValueValidator(3600)])
+    send_interval_seconds = models.PositiveIntegerField(default=1, validators=[MinValueValidator(0), MaxValueValidator(3600)])
     media = models.ForeignKey(UploadedMedia, null=True, blank=True, on_delete=models.SET_NULL)
     status = models.CharField(max_length=30, choices=Status.choices, default=Status.DRAFT)
     missing_value_policy = models.CharField(max_length=20, default="empty")

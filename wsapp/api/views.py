@@ -30,6 +30,7 @@ from .services.campaigns import (
     resume_campaign,
     send_next,
     start_campaign,
+    normalize_send_interval,
 )
 from .services.datasets import normalize_dataset, process_dataset
 from .services.media import upload_media
@@ -164,7 +165,7 @@ def select_phone_column(request, dataset_id):
 def preference_for(user):
     preference, _ = MessagingPreference.objects.get_or_create(
         owner=user,
-        defaults={"default_send_interval_seconds": max(settings.WASENDER_MIN_SEND_INTERVAL_SECONDS, min(int(settings.WASENDER_SEND_INTERVAL_SECONDS), 3600))},
+        defaults={"default_send_interval_seconds": normalize_send_interval(settings.WASENDER_SEND_INTERVAL_SECONDS)},
     )
     return preference
 
@@ -320,8 +321,7 @@ def messaging_settings_save(request):
     data = json_body(request)
     try: interval = int(data.get("default_send_interval_seconds"))
     except (TypeError, ValueError): return error("Enter a whole number of seconds.", {"default_send_interval_seconds": ["Required."]})
-    if interval < settings.WASENDER_MIN_SEND_INTERVAL_SECONDS: return error(f"Minimum allowed interval is {settings.WASENDER_MIN_SEND_INTERVAL_SECONDS} seconds because account protection is enabled.", {"default_send_interval_seconds": [f"Minimum allowed interval is {settings.WASENDER_MIN_SEND_INTERVAL_SECONDS} seconds because account protection is enabled."]})
-    if interval > 3600: return error("Interval must be between 5 and 3600 seconds.", {"default_send_interval_seconds": ["Out of range."]})
+    if not 0 <= interval <= settings.WASENDER_MAX_SEND_INTERVAL_SECONDS: return error("Send interval must be between 0 and 3600 seconds.", {"default_send_interval_seconds": ["Out of range."]})
     preference = preference_for(request.user)
     preference.default_send_interval_seconds = interval
     preference.auto_check_whatsapp_after_normalization = bool(data.get("auto_check_whatsapp_after_normalization"))
@@ -359,8 +359,7 @@ def campaign_create(request, dataset_id):
             return error("Media upload must finish before creating a campaign.", {"media_id": ["Upload failed or is incomplete."]})
     try: interval = int(data.get("send_interval_seconds", preference_for(request.user).default_send_interval_seconds))
     except (TypeError, ValueError): return error("Enter a valid send interval.", {"send_interval_seconds": ["Required."]})
-    if interval < settings.WASENDER_MIN_SEND_INTERVAL_SECONDS: return error(f"Minimum allowed interval is {settings.WASENDER_MIN_SEND_INTERVAL_SECONDS} seconds because account protection is enabled.", {"send_interval_seconds": [f"Minimum allowed interval is {settings.WASENDER_MIN_SEND_INTERVAL_SECONDS} seconds because account protection is enabled."]})
-    if interval > 3600: return error("Send interval must be between 5 and 3600 seconds.", {"send_interval_seconds": ["Out of range."]})
+    if not 0 <= interval <= settings.WASENDER_MAX_SEND_INTERVAL_SECONDS: return error("Send interval must be between 0 and 3600 seconds.", {"send_interval_seconds": ["Out of range."]})
     campaign = Campaign.objects.create(owner=request.user, dataset=dataset, name=data.get("name", "Untitled campaign")[:150], body_snapshot=data.get("body", ""), selected_phone_column=dataset.selected_phone_column, send_interval_seconds=interval, missing_value_policy=data.get("missing_value_policy", "empty"), missing_value_fallback=data.get("missing_value_fallback", ""), allow_duplicates=bool(data.get("allow_duplicates")), allow_unknown=bool(data.get("allow_unknown")), opt_in_confirmed=True, media=media, status=Campaign.Status.READY, send_config_snapshot={"interval_seconds": interval, "placeholders": detected})
     return ok({"id": str(campaign.id), "url": f"/campaigns/{campaign.id}/"})
 
@@ -743,7 +742,7 @@ def message_auto_sync_statuses(request):
             continue
         if entry.next_status_check_at and entry.next_status_check_at > now:
             skipped += 1
-            results.append({"id": entry_id, "ok": True, "changed": False, "skipped": True, "row": serialize_row(entry, serials.get(entry_id))})
+            results.append({"id": entry_id, "ok": True, "changed": False, "skipped": True, "next_check_seconds": max(0, int((entry.next_status_check_at - now).total_seconds()))})
             continue
         checked += 1
         old_state = entry.state
@@ -754,17 +753,23 @@ def message_auto_sync_statuses(request):
                 # A second tab may have progressed this row while this request was in flight.
                 locked, row_changed = apply_provider_status(locked, provider.data, checked_at=timezone.now())
             changed += int(row_changed)
-            results.append({"id": str(locked.id), "ok": True, "changed": row_changed, "old_state": old_state, "new_state": locked.state, "row": serialize_row(locked, serials.get(entry_id)), "campaign_counts": campaign_counts(locked.campaign)})
+            result = {"id": str(locked.id), "ok": True, "changed": row_changed, "skipped": False, "next_check_seconds": 5}
+            if row_changed:
+                row = serialize_row(locked, serials.get(entry_id))
+                result.update({"old_state": old_state, "new_state": locked.state,
+                               "patch": {key: row[key] for key in ("state", "state_label", "provider_status_code", "provider_status_text", "provider_status_checked_at", "sent_at", "delivered_at", "read_at", "status_sync_eligible", "can_refresh_status", "delivery_explanation")},
+                               "campaign_counts": campaign_counts(locked.campaign)})
+            results.append(result)
         except WasenderError as exc:
             with transaction.atomic():
                 locked = CampaignRecipient.objects.select_for_update().select_related("campaign", "imported_recipient").get(pk=entry.pk, campaign__owner=request.user)
                 record_status_sync_error(locked, exc)
             authentication_failed = authentication_failed or isinstance(exc, UnauthorizedError) or exc.status == 401
-            results.append({"id": entry_id, "ok": False, "changed": False, "old_state": old_state, "new_state": old_state, "error": "Provider status is temporarily unavailable.", "auth_failed": isinstance(exc, UnauthorizedError) or exc.status == 401, "row": serialize_row(locked, serials.get(entry_id))})
+            results.append({"id": entry_id, "ok": False, "changed": False, "old_state": old_state, "new_state": old_state, "error": "Provider status is temporarily unavailable.", "auth_failed": isinstance(exc, UnauthorizedError) or exc.status == 401})
             if authentication_failed:
                 break
     campaign_counts_data = {}
-    campaign_ids = {result.get("row", {}).get("campaign_id") for result in results if result.get("row")}
+    campaign_ids = {str(entry.campaign_id) for entry in owned.values()} if changed else set()
     for value in campaign_ids:
         if value:
             campaign = Campaign.objects.filter(pk=value, owner=request.user).first()
