@@ -1,4 +1,5 @@
 import json
+import base64
 from dataclasses import dataclass
 
 import requests
@@ -145,18 +146,71 @@ class WasenderClient:
         if not isinstance(payload, dict): raise MalformedResponseError("Malformed provider payload.", response.status_code)
         return ProviderResult(payload, response.status_code)
 
-    def send_message(self, phone, text="", media_field=None, media_url=None):
+    def send_message(self, phone, text="", media_field=None, media_url=None, file_name=None):
         payload = {"to": phone}
         if text: payload["text"] = text
         if media_field and media_url: payload[media_field] = media_url
+        if media_field == "documentUrl" and media_url and file_name:
+            payload["fileName"] = str(file_name).replace("\\", "/").rsplit("/", 1)[-1]
         result = self._request("POST", "/api/send-message", json=payload)
         if result.data.get("success") is not True:
             message = result.data.get("message") or result.data.get("error") or "Provider rejected the message."
             raise WasenderError(_safe_message(message), result.http_status, result.data)
         return result
     def check_number(self, phone): return self._request("GET", f"/api/on-whatsapp/{phone}")
-    def upload_media(self, fileobj, mime):
+    def upload_media_raw(self, fileobj, mime):
+        fileobj.seek(0)
         return self._request("POST", "/api/upload", headers={"Content-Type": mime}, data=fileobj)
+
+    def upload_media(self, fileobj, mime, extension=""):
+        """Upload media once as bytes; OOXML validation failures get one fallback."""
+        try:
+            result = self.upload_media_raw(fileobj, mime)
+            self._validate_upload_result(result)
+            result.upload_method = "raw"
+            return result
+        except WasenderError as exc:
+            exc.upload_method = "raw"
+            if not self._can_base64_fallback(exc, extension, fileobj):
+                raise
+            fileobj.seek(0)
+            encoded = base64.b64encode(fileobj.read()).decode("ascii")
+            fileobj.seek(0)
+            try:
+                result = self._request(
+                    "POST", "/api/upload",
+                    json={"mimetype": mime, "base64": encoded},
+                )
+                self._validate_upload_result(result)
+            except WasenderError as fallback_exc:
+                fallback_exc.upload_method = "base64_fallback"
+                raise
+            result.upload_method = "base64_fallback"
+            return result
+
+    @staticmethod
+    def _upload_url(result):
+        data = result.data.get("data", result.data)
+        return data.get("publicUrl", "") if isinstance(data, dict) else ""
+
+    def _validate_upload_result(self, result):
+        if result.data.get("success") is not True or not self._upload_url(result):
+            message = result.data.get("message") or result.data.get("error") or "Provider did not return a media URL."
+            raise WasenderError(_safe_message(message), result.http_status, result.data)
+
+    @staticmethod
+    def _can_base64_fallback(exc, extension, fileobj):
+        size = getattr(fileobj, "size", None)
+        if size is None:
+            position = fileobj.tell()
+            fileobj.seek(0, 2)
+            size = fileobj.tell()
+            fileobj.seek(position)
+        return (
+            extension.lower() in {".xlsx", ".docx"}
+            and exc.status in {400, 422}
+            and size <= settings.MEDIA_BASE64_FALLBACK_MAX_BYTES
+        )
     def _successful_action(self, method, path, **kwargs):
         result = self._request(method, path, **kwargs)
         if result.data.get("success") is not True:

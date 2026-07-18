@@ -1,7 +1,6 @@
 import hashlib
 import json
 import uuid
-import mimetypes
 from datetime import timedelta
 from pathlib import Path
 
@@ -36,6 +35,7 @@ from .services.campaigns import (
 )
 from .services.datasets import normalize_dataset, process_dataset
 from .services.media import upload_media
+from .services.file_types import MediaValidationError, resolve_and_validate_media
 from .services.phones import normalize_tanzania_phone
 from .services.templates import TemplateError, render_message, validate_template
 from .services.wasender import WasenderClient, WasenderError, UnauthorizedError
@@ -373,25 +373,27 @@ def campaign_create(request, dataset_id):
 @require_POST
 def media_create(request):
     file = request.FILES.get("file")
-    if not file: return error("Choose a media file.", {"file": ["Required."]})
-    mime = (file.content_type or "").lower()
-    guessed, _ = mimetypes.guess_type(file.name)
-    if not mime or mime == "application/octet-stream": mime = (guessed or "").lower()
-    types = {
-        "image/jpeg": "image", "image/png": "image", "image/webp": "image",
-        "video/mp4": "video", "audio/mpeg": "audio", "audio/ogg": "audio",
-        "application/pdf": "document", "application/msword": "document",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "document", "application/vnd.ms-excel": "document", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "document", "text/csv": "document", "text/plain": "document",
-    }
-    if mime not in types: return error("Unsupported media type.", {"file": ["Use JPEG, PNG, WebP, MP4, MP3, OGG, PDF, DOC or DOCX."]})
-    if file.size > settings.MEDIA_MAX_BYTES: return error("Media is too large.")
+    if not file:
+        return error("Choose a media file.", {"file": ["Required."]})
+    try:
+        resolved = resolve_and_validate_media(file)
+    except MediaValidationError as exc:
+        return error("The media file could not be uploaded.", {"file": [str(exc)]}, data={"code": exc.code})
     digest = hashlib.sha256()
     for chunk in file.chunks(): digest.update(chunk)
     file.seek(0)
-    media = UploadedMedia.objects.create(owner=request.user, original_file=file, original_filename=Path(file.name).name[:255], mime_type=mime, media_type=types[mime], size=file.size, checksum=digest.hexdigest())
+    media = UploadedMedia.objects.create(
+        owner=request.user, original_file=file, original_filename=Path(file.name).name[:255],
+        mime_type=resolved.canonical_mime, media_type=resolved.media_type,
+        size=file.size, checksum=digest.hexdigest(),
+    )
     media = upload_media(str(media.id))
     if media.upload_status == UploadedMedia.Status.FAILED:
-        return error(media.upload_error or "Provider media upload failed.", data={"id": str(media.id), "status": media.upload_status})
+        return error(
+            "The media file could not be uploaded.",
+            {"file": [media.upload_error or "Provider media upload failed."]},
+            data={"id": str(media.id), "status": media.upload_status, "code": "provider_media_validation"},
+        )
     return ok({"id": str(media.id), "status": media.upload_status}, "Media retained and uploaded.")
 
 

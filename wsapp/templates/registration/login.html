@@ -1,5 +1,5 @@
 {% extends "base.html" %}{% block title %}Sign in · Waya{% endblock %}{% block content %}
-<div class="auth-card card"><div class="card-body p-5"><div class="brand justify-content-center mb-4"><span>W</span> Waya</div><h1 class="h4 text-center">Welcome back</h1><p class="text-muted text-center">Sign in to manage your WhatsApp campaigns.</p>
+<div class="auth-card card"><div class="card-body p-5"><div class="brand justify-content-center mb-4"><span></span>Hellens Sec</div><h1 class="h4 text-center">Welcome back</h1><p class="text-muted text-center">Sign in to manage your WhatsApp campaigns.</p>
 <form method="post">{% csrf_token %}{{ form.non_field_errors }}<label class="form-label">Username</label><input class="form-control mb-3" name="username" autofocus required><label class="form-label">Password</label><input class="form-control mb-3" type="password" name="password" required><button class="btn btn-purple w-100">Sign in</button></form>
 <a class="small d-block text-center mt-3" href="{% url 'password_reset' %}">Forgot password?</a></div></div>
 {% endblock %}

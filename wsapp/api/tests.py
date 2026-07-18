@@ -1,5 +1,6 @@
 import io
 import json
+import base64
 from pathlib import Path
 from datetime import timedelta
 from unittest.mock import Mock, patch
@@ -36,6 +37,7 @@ from .services.wasender import (
     WasenderError,
     normalize_message_status,
 )
+from .services.file_types import MediaValidationError, resolve_and_validate_media
 
 User = get_user_model()
 
@@ -377,6 +379,71 @@ class SynchronousUploadMediaTests(TestCase):
         self.assertTrue(media.original_file)
 
 
+class ExcelMediaRegressionTests(TestCase):
+    """All upload calls are mocked: these tests never contact the provider."""
+    def setUp(self):
+        self.user = User.objects.create_user("excel-files", password="pw")
+        self.client.force_login(self.user)
+
+    @staticmethod
+    def xlsx_bytes():
+        workbook = Workbook()
+        workbook.active["A1"] = "students"
+        output = io.BytesIO()
+        workbook.save(output)
+        return output.getvalue()
+
+    def post_media(self, name, content, content_type=""):
+        return self.client.post(reverse("media_create"), {
+            "file": SimpleUploadedFile(name, content, content_type=content_type),
+        })
+
+    @patch("api.services.media.WasenderClient.upload_media")
+    def test_xlsx_accepts_generic_and_zip_browser_mime_and_stores_canonical_mime(self, upload):
+        upload.return_value = ProviderResult({"publicUrl": "https://cdn.invalid/a.xlsx"}, 200)
+        for mime in ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/octet-stream", "application/zip", ""):
+            response = self.post_media("students.xlsx", self.xlsx_bytes(), mime)
+            self.assertEqual(response.status_code, 200, response.content)
+        media = UploadedMedia.objects.filter(owner=self.user).latest("created_at")
+        self.assertEqual(media.mime_type, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        self.assertEqual(media.original_filename, "students.xlsx")
+
+    @patch("api.services.media.WasenderClient.upload_media")
+    def test_csv_pdf_xls_and_safe_basename(self, upload):
+        upload.return_value = ProviderResult({"publicUrl": "https://cdn.invalid/document"}, 200)
+        self.assertEqual(self.post_media("../../people.csv", b"name,phone\nAda,0712\n", "text/csv").status_code, 200)
+        self.assertEqual(self.post_media("report.pdf", b"%PDF-1.4\nbody", "application/pdf").status_code, 200)
+        self.assertEqual(self.post_media("legacy.xls", bytes.fromhex("D0CF11E0A1B11AE1") + b"legacy", "application/vnd.ms-excel").status_code, 200)
+        media = UploadedMedia.objects.filter(owner=self.user, original_filename="people.csv").get()
+        self.assertEqual(media.original_filename, "people.csv")
+
+    def test_corrupt_or_arbitrary_zip_xlsx_gets_field_error(self):
+        for content in (b"not a workbook", b"PK\x03\x04not-a-real-zip"):
+            response = self.post_media("bad.xlsx", content, "application/zip")
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("file", response.json()["errors"])
+            self.assertIn("code", response.json()["data"])
+
+    @patch("api.services.media.WasenderClient.upload_media")
+    def test_provider_rejection_returns_safe_field_error(self, upload):
+        upload.side_effect = ValidationError("provider detail that is not returned", 422, {})
+        response = self.post_media("students.xlsx", self.xlsx_bytes(), "application/zip")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["data"]["code"], "provider_media_validation")
+        self.assertEqual(response.json()["errors"]["file"], ["The provider rejected this media type."])
+
+    @override_settings(MEDIA_DOCUMENT_MAX_BYTES=10, MEDIA_IMAGE_MAX_BYTES=3)
+    def test_category_size_policy_uses_document_limit(self):
+        with self.assertRaises(MediaValidationError):
+            resolve_and_validate_media(SimpleUploadedFile("large.jpg", b"1234", content_type="image/jpeg"))
+        self.assertEqual(
+            resolve_and_validate_media(SimpleUploadedFile("small.csv", b"1234", content_type="text/csv")).category,
+            "document",
+        )
+        with self.assertRaises(MediaValidationError):
+            resolve_and_validate_media(SimpleUploadedFile("large.csv", b"12345678901", content_type="text/csv"))
+
+
 class ProviderClientTests(TestCase):
     def response(self, status, payload=None, text=""):
         response = Mock(status_code=status, ok=status < 400, headers={}, text=text)
@@ -418,6 +485,31 @@ class ProviderClientTests(TestCase):
             self.client_for(self.response(200, None, "not json")).check_number(
                 "+255712345678"
             )
+
+    def test_ooxml_raw_upload_uses_canonical_mime_and_one_base64_fallback(self):
+        content = ExcelMediaRegressionTests.xlsx_bytes()
+        session = Mock()
+        session.request.side_effect = [
+            self.response(422, {"message": "invalid media type"}),
+            self.response(200, {"success": True, "publicUrl": "https://cdn.invalid/workbook"}),
+        ]
+        client = WasenderClient(api_key="example", base_url="https://example.invalid", session=session)
+        result = client.upload_media(io.BytesIO(content), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx")
+        self.assertEqual(result.http_status, 200)
+        self.assertEqual(session.request.call_count, 2)
+        self.assertEqual(session.request.call_args_list[0].kwargs["headers"]["Content-Type"], "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        fallback = session.request.call_args_list[1].kwargs["json"]
+        self.assertEqual(fallback["mimetype"], "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        self.assertEqual(base64.b64decode(fallback["base64"]), content)
+
+    def test_document_filename_only_goes_to_document_payload(self):
+        session = Mock()
+        session.request.return_value = self.response(200, {"success": True, "data": {}})
+        client = WasenderClient(api_key="example", base_url="https://example.invalid", session=session)
+        client.send_message("+255712345678", "Report", "documentUrl", "https://cdn.invalid/a", "students.xlsx")
+        self.assertEqual(session.request.call_args.kwargs["json"]["fileName"], "students.xlsx")
+        client.send_message("+255712345678", "Photo", "imageUrl", "https://cdn.invalid/i", "photo.jpg")
+        self.assertNotIn("fileName", session.request.call_args.kwargs["json"])
 
 
 class CsrfAndFrontendTests(TestCase):

@@ -8,7 +8,7 @@
 {% if user.is_authenticated %}
 <form id="globalCsrfForm" class="d-none" aria-hidden="true">{% csrf_token %}</form>
 <aside class="sidebar">
-  <a class="brand" href="{% url 'dashboard' %}"><span></span>WhatsApp SMS</a>
+  <a class="brand" href="{% url 'dashboard' %}"><span></span>Hellens Sec</a>
   <nav>
     <a href="{% url 'dashboard' %}">▦ Dashboard</a><a href="{% url 'uploads' %}">⇧ Uploads</a>
     <a href="{% url 'uploads' %}">♙ Recipients</a><a href="{% url 'campaigns' %}">✦ Campaigns</a>

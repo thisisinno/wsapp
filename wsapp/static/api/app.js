@@ -262,7 +262,53 @@ const Waya = (() => {
     });
     interval.addEventListener("input", updateInterval);
     updateInterval();
-    document.querySelector("#media").onchange = (event) => { const file = event.target.files[0]; document.querySelector("#mediaFeedback").textContent = file ? `${file.name} · ${file.type || "detected from file"} · ${Math.ceil(file.size / 1024)} KB` : ""; };
+    const mediaInput = document.querySelector("#media");
+    const mediaFeedback = document.querySelector("#mediaFeedback");
+    const mediaActions = document.querySelector("#mediaActions");
+    const extensionLabels = { xlsx: "Excel workbook", xls: "Excel workbook", csv: "CSV document", pdf: "PDF document", doc: "Word document", docx: "Word document", txt: "Text document" };
+    let uploadedMediaId = "";
+    let uploadInFlight = false;
+    const describeFile = (file) => {
+      const extension = (file.name.split(".").pop() || "").toLowerCase();
+      return `${file.name} · ${extensionLabels[extension] || file.type || "Media file"} · ${Math.max(1, Math.ceil(file.size / 1024))} KB`;
+    };
+    const showMedia = (text, state = "") => {
+      mediaFeedback.textContent = text;
+      mediaFeedback.className = `media-feedback small mt-1 ${state}`;
+    };
+    const uploadSelectedMedia = async () => {
+      const file = mediaInput.files[0];
+      if (!file || uploadInFlight) return "";
+      uploadInFlight = true;
+      uploadedMediaId = "";
+      mediaActions.hidden = true;
+      showMedia(`Validating ${extensionLabels[(file.name.split(".").pop() || "").toLowerCase()] || "media"}…`, "is-pending");
+      try {
+        const form = new FormData(); form.append("file", file);
+        showMedia("Uploading to WhatsApp provider…", "is-pending");
+        const data = await request("/media/new/", { method: "POST", body: form });
+        uploadedMediaId = data.id;
+        showMedia(`Ready: ${file.name}`, "is-ready");
+        return uploadedMediaId;
+      } catch (error) {
+        const fieldError = error.payload?.errors?.file?.[0] || error.message;
+        showMedia(`${extensionLabels[(file.name.split(".").pop() || "").toLowerCase()] || "Media"} upload failed: ${fieldError}`, "is-error");
+        mediaActions.hidden = false;
+        throw error;
+      } finally { uploadInFlight = false; }
+    };
+    mediaInput.onchange = () => {
+      uploadedMediaId = "";
+      const file = mediaInput.files[0];
+      mediaActions.hidden = !file;
+      showMedia(file ? `Selected: ${describeFile(file)}` : "");
+    };
+    document.querySelector("#removeMedia").onclick = () => {
+      mediaInput.value = ""; uploadedMediaId = ""; mediaActions.hidden = true; showMedia("");
+    };
+    document.querySelector("#retryMediaUpload").onclick = async () => {
+      try { await uploadSelectedMedia(); } catch (_) { /* Inline feedback already explains the failure. */ }
+    };
     document.querySelector("#campaignForm").onsubmit = async (event) => {
       event.preventDefault();
       const parsed = updateInterval();
@@ -275,12 +321,10 @@ const Waya = (() => {
       if (!submitButton || submitButton.disabled) return;
       submitButton.disabled = true;
       try {
-        let media_id = "";
-        const file = document.querySelector("#media").files[0];
+        let media_id = uploadedMediaId;
+        const file = mediaInput.files[0];
         if (file) {
-          const form = new FormData();
-          form.append("file", file);
-          media_id = (await request("/media/new/", { method: "POST", body: form })).id;
+          media_id = uploadedMediaId || await uploadSelectedMedia();
         }
         const data = await request(`/campaigns/create/${id}/`, {
           method: "POST",

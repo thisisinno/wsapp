@@ -30,7 +30,13 @@
         <div id="sendIntervalFeedback" class="invalid-feedback" hidden></div>
         <small id="sendIntervalHelp" class="text-muted">Leave blank to use the selected/default delay. Zero means no added delay; messages are still sent one at a time.</small>
       </fieldset>
-      <label class="form-label mt-3" for="media">Optional media</label><input id="media" class="form-control" type="file" accept="image/*,video/mp4,audio/*,.pdf,.doc,.docx,.xls,.xlsx,.csv,.txt"><div id="mediaFeedback" class="small mt-1"></div>
+      <label class="form-label mt-3" for="media">Optional media</label>
+      <input id="media" class="form-control" type="file" accept="image/*,video/mp4,audio/*,.pdf,.doc,.docx,.xls,.xlsx,.csv,.txt" aria-describedby="mediaFeedback">
+      <div id="mediaFeedback" class="media-feedback small mt-1" aria-live="polite"></div>
+      <div class="mt-2 d-flex gap-2" id="mediaActions" hidden>
+        <button type="button" id="retryMediaUpload" class="btn btn-sm btn-outline-primary">Retry media upload</button>
+        <button type="button" id="removeMedia" class="btn btn-sm btn-outline-secondary">Remove attachment</button>
+      </div>
       <label class="form-label mt-3" for="policy">Missing values</label><select id="policy" class="form-select"><option value="empty">Replace with empty text</option><option value="fallback">Use fallback value</option><option value="skip">Skip recipient</option></select><input id="fallback" class="form-control mt-2" placeholder="Fallback value">
       <div class="form-check mt-3"><input id="unknown" class="form-check-input" type="checkbox"><label class="form-check-label">Include locally valid numbers whose WhatsApp registration has not been confirmed</label></div><div class="form-check"><input id="duplicates" class="form-check-input" type="checkbox"><label class="form-check-label">Intentionally send to duplicate numbers</label></div><div class="form-check mt-3"><input id="optin" class="form-check-input" type="checkbox" required><label class="form-check-label">I confirm these recipients gave permission/opt-in to be contacted.</label></div><button class="btn btn-purple mt-4" type="submit">Create campaign</button>
     </form>

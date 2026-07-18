@@ -287,7 +287,10 @@ def resend_message(entry_id, owner_id, data, client=None):
                     media_url = media.provider_public_url
                     attempt.request_payload = {"to": entry.normalized_phone, "text": entry.rendered_message, "media_type": media.media_type, "media_url": media_url, "original_filename": media.original_filename}
                     attempt.save(update_fields=["request_payload", "updated_at"])
-                result = provider_client.send_message(entry.normalized_phone, entry.rendered_message, media_field, media_url)
+                result = provider_client.send_message(
+                    entry.normalized_phone, entry.rendered_message, media_field, media_url,
+                    media.original_filename if media_field == "documentUrl" else None,
+                )
             provider_data = _provider_data(result)
             status_text = provider_data.get("status", "pending")
             normalized = normalize_message_status(

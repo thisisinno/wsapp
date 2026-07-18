@@ -390,11 +390,15 @@ def send_next(campaign_id, owner_id, run_token):
                 "document": "documentUrl",
             }.get(media.media_type)
             media_url = media.provider_public_url
+            payload.update({"media_type": media.media_type, "original_filename": media.original_filename})
+            attempt.request_payload = payload
+            attempt.save(update_fields=["request_payload", "updated_at"])
         provider = WasenderClient().send_message(
             entry.normalized_phone,
             entry.rendered_message,
             media_field,
             media_url,
+            media.original_filename if campaign.media and media_field == "documentUrl" else None,
         )
         data = provider.data.get("data", {})
         safe_payload = _safe_provider_payload(provider.data)
