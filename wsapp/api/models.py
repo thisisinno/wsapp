@@ -169,6 +169,10 @@ class CampaignRecipient(UUIDTimeModel):
     read_at = models.DateTimeField(null=True, blank=True)
     failed_at = models.DateTimeField(null=True, blank=True)
     provider_status_checked_at = models.DateTimeField(null=True, blank=True)
+    # These describe observation failures only; they never mean that sending failed.
+    status_sync_failure_count = models.PositiveIntegerField(default=0)
+    status_sync_error = models.CharField(max_length=255, blank=True)
+    next_status_check_at = models.DateTimeField(null=True, blank=True, db_index=True)
     provider_edited_at = models.DateTimeField(null=True, blank=True)
     provider_deleted_at = models.DateTimeField(null=True, blank=True)
     provider_action_error = models.TextField(blank=True, default="")

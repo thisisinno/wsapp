@@ -21,7 +21,13 @@ from api.services.wasender import (
 
 MAX_MESSAGE_LENGTH = 4096
 DELIVERED_STATES = {"delivered", "read", "played"}
-TERMINAL_STATES = {"delivered", "read", "played", "failed"}
+STATUS_SYNC_ELIGIBLE_STATES = {"accepted", "pending", "sent", "delivered"}
+STATUS_SYNC_FINAL_STATES = {"read", "played", "failed"}
+STATUS_SYNC_PENDING_SECONDS = 5
+STATUS_SYNC_SENT_SECONDS = 5
+STATUS_SYNC_DELIVERED_SECONDS = 10
+STATUS_SYNC_ERROR_BACKOFF_SECONDS = 30
+STATUS_SYNC_BATCH_SIZE = 5
 
 
 class MessageActionError(Exception):
@@ -59,39 +65,48 @@ def _validate_text(value):
     return text
 
 
-def refresh_status(entry, client=None):
-    if not entry.provider_message_id:
-        raise MessageActionError("This message has no provider message ID.")
-    if entry.provider_deleted_at:
-        raise MessageActionError("A deleted provider message cannot be refreshed.")
-    try:
-        result = (client or WasenderClient()).message_info(entry.provider_message_id)
-    except WasenderError as exc:
-        _provider_failure(entry, exc)
-    payload = safe_provider_payload(result.data)
-    data = _provider_data(result)
+def provider_status_values(provider_payload):
+    """Read acknowledgement variants without guessing beyond documented values."""
+    data = provider_payload.get("data", provider_payload) if isinstance(provider_payload, dict) else {}
+    data = data if isinstance(data, dict) else {}
     raw_status = data.get("status")
-    raw_code = data.get("ack", data.get("statusCode", data.get("status_code")))
-    if raw_code is None and isinstance(raw_status, int):
+    raw_code = data.get("ack")
+    if raw_code is None:
+        raw_code = data.get("statusCode", data.get("status_code"))
+    if raw_code is None and isinstance(raw_status, (int, float)):
         raw_code = raw_status
-    raw_text = data.get("status", data.get("statusText", ""))
+    raw_text = data.get("statusText") or (raw_status if not isinstance(raw_status, (int, float)) else "") or ""
+    return raw_code, raw_text
+
+
+def status_sync_delay(state):
+    return STATUS_SYNC_DELIVERED_SECONDS if state == "delivered" else (
+        STATUS_SYNC_SENT_SECONDS if state == "sent" else STATUS_SYNC_PENDING_SECONDS
+    )
+
+
+def apply_provider_status(entry, provider_payload, checked_at=None):
+    """Apply one provider observation monotonically. Caller holds the row lock."""
+    now = checked_at or timezone.now()
+    raw_code, raw_text = provider_status_values(provider_payload)
     normalized = normalize_message_status(raw_code, raw_text)
-    now = timezone.now()
     old_state = entry.state
-    entry.provider_status_code = raw_code if isinstance(raw_code, int) else None
+    old_level = ACK_LEVELS.get(old_state, -1)
+    new_level = ACK_LEVELS.get(normalized, -1)
     try:
-        if raw_code is not None:
-            entry.provider_status_code = int(raw_code)
+        entry.provider_status_code = int(raw_code) if raw_code is not None else None
     except (TypeError, ValueError):
         entry.provider_status_code = None
     entry.provider_status_text = str(raw_text or raw_code or "")[:100]
     entry.provider_status_checked_at = now
-    entry.last_provider_payload = payload
-    entry.provider_action_error = ""
-
-    old_level = ACK_LEVELS.get(old_state, -1)
-    new_level = ACK_LEVELS.get(normalized, -1)
-    if normalized == "failed" or new_level > old_level:
+    entry.last_provider_payload = safe_provider_payload(provider_payload)
+    entry.status_sync_failure_count = 0
+    entry.status_sync_error = ""
+    # Failures are meaningful only before a confirmed delivery acknowledgement.
+    if normalized == "failed":
+        if old_state not in DELIVERED_STATES:
+            entry.state = "failed"
+    elif new_level > old_level:
         entry.state = normalized
     if ACK_LEVELS.get(entry.state, -1) >= ACK_LEVELS["sent"] and not entry.sent_at:
         entry.sent_at = now
@@ -101,10 +116,45 @@ def refresh_status(entry, client=None):
         entry.read_at = now
     if entry.state == "failed" and not entry.failed_at:
         entry.failed_at = now
+    entry.next_status_check_at = (
+        now + timedelta(seconds=status_sync_delay(entry.state))
+        if entry.state in STATUS_SYNC_ELIGIBLE_STATES and not entry.provider_deleted_at else None
+    )
     entry.save()
     if entry.state != old_state:
         recalculate_campaign(entry.campaign_id, finalize=False)
-    return entry
+    return entry, entry.state != old_state
+
+
+def record_status_sync_error(entry, exc, checked_at=None):
+    now = checked_at or timezone.now()
+    entry.status_sync_failure_count += 1
+    entry.status_sync_error = safe_provider_text(exc)[:255]
+    retry_after = getattr(exc, "retry_after", None)
+    try:
+        delay = max(STATUS_SYNC_ERROR_BACKOFF_SECONDS, int(retry_after or 0))
+    except (TypeError, ValueError):
+        delay = STATUS_SYNC_ERROR_BACKOFF_SECONDS
+    delay = min(60, delay * max(1, min(entry.status_sync_failure_count, 2)))
+    entry.provider_status_checked_at = now
+    entry.next_status_check_at = now + timedelta(seconds=delay)
+    entry.save(update_fields=["status_sync_failure_count", "status_sync_error", "provider_status_checked_at", "next_status_check_at", "updated_at"])
+
+
+def refresh_status(entry, client=None):
+    if not entry.provider_message_id:
+        raise MessageActionError("This message has no provider message ID.")
+    if entry.provider_deleted_at:
+        raise MessageActionError("A deleted provider message cannot be refreshed.")
+    try:
+        result = (client or WasenderClient()).message_info(entry.provider_message_id)
+    except WasenderError as exc:
+        record_status_sync_error(entry, exc)
+        raise MessageActionError(safe_provider_text(exc), status=exc.status if exc.status and exc.status < 500 else 502)
+    with transaction.atomic():
+        locked = CampaignRecipient.objects.select_for_update().select_related("campaign").get(pk=entry.pk)
+        locked, _ = apply_provider_status(locked, result.data)
+    return locked
 
 
 def update_message(entry, data, client=None):
@@ -325,6 +375,7 @@ def serialize_row(entry, serial_number=None):
         "provider_message_id": entry.provider_message_id,
         "state": state,
         "state_label": labels.get(state, "Unknown"),
+        "status_icon": {"pending": "pending", "sent": "sent", "delivered": "delivered", "read": "read", "played": "played", "failed": "failed", "deleted": "deleted"}.get(state, "unknown"),
         "delivery_explanation": "Delivered" if entry.state in DELIVERED_STATES else "Not delivered yet",
         "is_delivered": entry.state in DELIVERED_STATES,
         "is_deleted": bool(entry.provider_deleted_at),
@@ -341,6 +392,8 @@ def serialize_row(entry, serial_number=None):
         "retry_count": entry.retry_count,
         "attempt_count": attempt_count,
         "failure_reason": entry.skip_reason or entry.provider_action_error,
+        "status_sync_eligible": bool(entry.provider_message_id and not entry.provider_deleted_at and entry.state in STATUS_SYNC_ELIGIBLE_STATES),
+        "next_status_check_at": stamp(entry.next_status_check_at),
         "can_update": not entry.provider_deleted_at and bool(
             entry.provider_message_id or entry.state == CampaignRecipient.State.FAILED
         ),

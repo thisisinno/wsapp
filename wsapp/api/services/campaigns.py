@@ -359,13 +359,14 @@ def send_next(campaign_id, owner_id, run_token):
         with transaction.atomic():
             locked = CampaignRecipient.objects.select_for_update().get(pk=entry.pk)
             locked.state = CampaignRecipient.State.ACCEPTED
-            locked.provider_message_id = str(data.get("msgId", ""))
+            locked.provider_message_id = str(data.get("msgId") or data.get("id") or "")
             locked.provider_jid = str(data.get("jid", ""))
-            locked.provider_status_text = str(data.get("status", "accepted"))
-            locked.last_provider_payload = safe_payload
             locked.attempt_finished_at = timezone.now()
             locked.skip_reason = ""
-            locked.save()
+            # A successful HTTP request is only acceptance.  Apply any stronger
+            # acknowledgement actually returned by the provider.
+            from api.services.message_logs import apply_provider_status
+            apply_provider_status(locked, provider.data, checked_at=timezone.now())
             attempt.http_status = provider.http_status
             attempt.provider_response = safe_payload
             attempt.provider_message_id = locked.provider_message_id

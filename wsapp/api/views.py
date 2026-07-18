@@ -35,14 +35,18 @@ from .services.datasets import normalize_dataset, process_dataset
 from .services.media import upload_media
 from .services.phones import normalize_tanzania_phone
 from .services.templates import TemplateError, render_message, validate_template
-from .services.wasender import WasenderClient, WasenderError
-from .services.wasender import safe_provider_payload
+from .services.wasender import WasenderClient, WasenderError, UnauthorizedError
+from .services.wasender import safe_provider_payload, safe_provider_text
 from .services.message_logs import (
     DELIVERED_STATES,
     MessageActionError,
     campaign_counts,
     delete_message as delete_logged_message,
     message_queryset,
+    STATUS_SYNC_BATCH_SIZE,
+    STATUS_SYNC_ELIGIBLE_STATES,
+    apply_provider_status,
+    record_status_sync_error,
     refresh_status as refresh_message_status_service,
     resend_message as resend_logged_message,
     serialize_row,
@@ -699,6 +703,76 @@ def message_refresh_status(request, entry_id):
         _action_data(entry, json_body(request).get("serial_number")),
         "Message status refreshed.",
     )
+
+
+@login_required
+@require_POST
+def message_auto_sync_statuses(request):
+    """Small, owner-scoped observational provider-status batch for open pages."""
+    data = json_body(request)
+    ids = data.get("ids", [])
+    if not isinstance(ids, list):
+        response = error("ids must be a list.", {"ids": ["Expected a list."]})
+        response["Cache-Control"] = "no-store"
+        return response
+    try:
+        requested_limit = int(data.get("limit", STATUS_SYNC_BATCH_SIZE))
+    except (TypeError, ValueError):
+        requested_limit = STATUS_SYNC_BATCH_SIZE
+    limit = min(10, max(1, requested_limit))
+    ids = [str(value) for value in ids[:limit]]
+    campaign_id = data.get("campaign_id")
+    query = CampaignRecipient.objects.filter(
+        id__in=ids,
+        campaign__owner=request.user,
+        provider_deleted_at__isnull=True,
+        state__in=STATUS_SYNC_ELIGIBLE_STATES,
+    ).exclude(provider_message_id="").select_related("campaign", "imported_recipient")
+    if campaign_id:
+        query = query.filter(campaign_id=campaign_id)
+    owned = {str(entry.id): entry for entry in query}
+    now = timezone.now()
+    results, checked, changed, skipped = [], 0, 0, 0
+    authentication_failed = False
+    serials = data.get("serial_numbers", {}) if isinstance(data.get("serial_numbers", {}), dict) else {}
+    for entry_id in ids:
+        entry = owned.get(entry_id)
+        # Deliberately do not reveal whether an arbitrary UUID belongs to another user.
+        if not entry:
+            skipped += 1
+            continue
+        if entry.next_status_check_at and entry.next_status_check_at > now:
+            skipped += 1
+            results.append({"id": entry_id, "ok": True, "changed": False, "skipped": True, "row": serialize_row(entry, serials.get(entry_id))})
+            continue
+        checked += 1
+        old_state = entry.state
+        try:
+            provider = WasenderClient().message_info(entry.provider_message_id)
+            with transaction.atomic():
+                locked = CampaignRecipient.objects.select_for_update().select_related("campaign", "imported_recipient").get(pk=entry.pk, campaign__owner=request.user)
+                # A second tab may have progressed this row while this request was in flight.
+                locked, row_changed = apply_provider_status(locked, provider.data, checked_at=timezone.now())
+            changed += int(row_changed)
+            results.append({"id": str(locked.id), "ok": True, "changed": row_changed, "old_state": old_state, "new_state": locked.state, "row": serialize_row(locked, serials.get(entry_id)), "campaign_counts": campaign_counts(locked.campaign)})
+        except WasenderError as exc:
+            with transaction.atomic():
+                locked = CampaignRecipient.objects.select_for_update().select_related("campaign", "imported_recipient").get(pk=entry.pk, campaign__owner=request.user)
+                record_status_sync_error(locked, exc)
+            authentication_failed = authentication_failed or isinstance(exc, UnauthorizedError) or exc.status == 401
+            results.append({"id": entry_id, "ok": False, "changed": False, "old_state": old_state, "new_state": old_state, "error": "Provider status is temporarily unavailable.", "auth_failed": isinstance(exc, UnauthorizedError) or exc.status == 401, "row": serialize_row(locked, serials.get(entry_id))})
+            if authentication_failed:
+                break
+    campaign_counts_data = {}
+    campaign_ids = {result.get("row", {}).get("campaign_id") for result in results if result.get("row")}
+    for value in campaign_ids:
+        if value:
+            campaign = Campaign.objects.filter(pk=value, owner=request.user).first()
+            if campaign:
+                campaign_counts_data[value] = campaign_counts(campaign)
+    response = ok({"results": results, "checked": checked, "changed": changed, "skipped": skipped, "campaign_counts": campaign_counts_data, "server_time": timezone.now().isoformat(), "next_poll_seconds": 5, "auth_failed": authentication_failed})
+    response["Cache-Control"] = "no-store"
+    return response
 
 
 @login_required

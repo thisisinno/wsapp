@@ -15,6 +15,7 @@
 
 <div id="providerAlert" class="alert alert-danger d-none" role="alert">WhatsApp provider is not configured.</div>
 <div id="liveDisconnect" class="alert alert-warning d-none" role="status"></div>
+<div id="liveStatusSync" class="live-status-sync mb-3" role="status" aria-live="polite"><span aria-hidden="true">●</span> Live status sync · Checking…</div>
 <div id="providerProtection" class="alert alert-warning d-none" role="status">Provider protection paused sending for 5 seconds. Sending will resume automatically.</div>
 
 <div class="card p-4 mb-4">
@@ -28,6 +29,9 @@
   <div class="col"><div class="card p-3"><small>Total sendable</small><strong id="sendable_total">0</strong></div></div>
   <div class="col"><div class="card p-3"><small>Processed</small><strong id="processed">0</strong></div></div>
   <div class="col"><div class="card p-3"><small>Provider accepted</small><strong id="accepted">0</strong></div></div>
+  <div class="col"><div class="card p-3"><small>Sent</small><strong id="sent">{{ campaign.sent_count }}</strong></div></div>
+  <div class="col"><div class="card p-3"><small>Delivered</small><strong id="delivered">{{ campaign.delivered_count }}</strong></div></div>
+  <div class="col"><div class="card p-3"><small>Read</small><strong id="read">{{ campaign.read_count }}</strong></div></div>
   <div class="col"><div class="card p-3"><small>Failed</small><strong id="failed">{{ campaign.failed_count }}</strong></div></div>
   <div class="col"><div class="card p-3"><small>Remaining</small><strong id="remaining">0</strong></div></div>
   <div class="col"><div class="card p-3"><small>Skipped</small><strong id="skipped">{{ campaign.skipped_count }}</strong></div></div>
@@ -37,7 +41,7 @@
 <div class="card p-4 mb-4">
   <div class="d-flex justify-content-between align-items-center mb-3">
     <h2 class="h5 mb-0">Live recipient queue</h2>
-    <button id="refreshVisible" class="btn btn-sm btn-outline-primary">↻ Refresh visible statuses</button>
+    <button id="refreshVisible" class="btn btn-sm btn-outline-primary">↻ Refresh now</button>
   </div>
   <div id="refreshProgress" class="text-muted d-none" role="status"></div>
   <div class="table-responsive">
@@ -62,4 +66,4 @@
 </div>
 {% include "api/message_modals.html" %}
 {% endblock %}
-{% block scripts %}<script>Waya.campaign("{{ campaign.id }}"); Waya.messageLogs("#recipientRows");</script>{% endblock %}
+{% block scripts %}<script>Waya.campaign("{{ campaign.id }}"); Waya.messageLogs("#recipientRows", {campaignId: "{{ campaign.id }}"});</script>{% endblock %}

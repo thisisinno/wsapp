@@ -34,6 +34,7 @@ urlpatterns = [
     path("campaigns/<uuid:campaign_id>/<str:action>/", views.campaign_action, name="campaign_action"),
     path("messages/", views.message_logs, name="message_logs"),
     path("messages/refresh-visible-statuses/", views.refresh_visible_statuses, name="refresh_visible_statuses"),
+    path("messages/auto-sync-statuses/", views.message_auto_sync_statuses, name="message_auto_sync_statuses"),
     path("messages/<uuid:entry_id>/detail/", views.message_detail, name="message_detail"),
     path("messages/<uuid:entry_id>/refresh-status/", views.message_refresh_status, name="message_refresh_status"),
     path("messages/<uuid:entry_id>/update/", views.message_update, name="message_update"),

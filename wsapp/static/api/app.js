@@ -320,12 +320,12 @@ const Waya = (() => {
       bar.style.width = `${data.percent}%`;
       bar.setAttribute("aria-valuenow", processed);
       bar.setAttribute("aria-valuemax", data.sendable_total || 1);
-      ["sendable_total", "processed", "accepted", "failed", "remaining", "skipped", "invalid"].forEach((key) => {
+      ["sendable_total", "processed", "accepted", "sent", "delivered", "read", "failed", "remaining", "skipped", "invalid"].forEach((key) => {
         $(`#${key}`).textContent = data[key];
       });
       $("#providerAlert").classList.toggle("d-none", data.provider_configured !== false);
       $("#recipientRows").innerHTML = data.recipients.map((row) => `
-        <tr id="message-${row.id}" data-message-id="${row.id}" data-serial="${row.sequence}" class="${row.state === "processing" || row.sequence === sendingSequence ? "table-primary" : ""}">
+        <tr id="message-${row.id}" data-message-id="${row.id}" data-serial="${row.sequence}" data-provider-message-id="${escapeHtml(row.provider_message_id || "")}" data-state="${escapeHtml(row.state)}" data-status-sync-eligible="${["accepted", "pending", "sent", "delivered"].includes(row.state) && row.provider_message_id && !row.is_deleted}" class="${row.state === "processing" || row.sequence === sendingSequence ? "table-primary" : ""}">
           <td><input type="checkbox" class="message-check" aria-label="Select message"></td><td>${row.sequence ?? "—"}</td>
           <td>${escapeHtml(row.phone_masked)}</td>
           <td><button class="btn btn-link p-0 text-start preview-cell" data-message-action="detail">${escapeHtml(row.preview)}</button></td>
@@ -475,7 +475,17 @@ const Waya = (() => {
       if (!document.hidden) progress();
     });
     progress();
-    pollTimer = setInterval(() => { if (!document.hidden) progress(); }, 25000);
+    const scheduleProgress = () => {
+      clearTimeout(pollTimer);
+      if (document.hidden) return;
+      const active = lastProgress?.status === "sending";
+      const deliveryPending = (lastProgress?.accepted || 0) + (lastProgress?.sent || 0) + (lastProgress?.delivered || 0) > 0;
+      const delay = active ? 2500 : deliveryPending ? 5000 : 30000;
+      pollTimer = setTimeout(async () => { await progress(); scheduleProgress(); }, delay);
+    };
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) { progress().then(scheduleProgress); } else clearTimeout(pollTimer); });
+    window.addEventListener("pagehide", () => clearTimeout(pollTimer), { once: true });
+    progress().then(scheduleProgress);
   }
 
   function escapeHtml(value) {
@@ -484,7 +494,7 @@ const Waya = (() => {
     return node.innerHTML;
   }
 
-  function messageLogs(selector = "#messageRows") {
+  function messageLogs(selector = "#messageRows", options = {}) {
     const rows = document.querySelector(selector);
     if (!rows) return;
     const detailModal = bootstrap.Modal.getOrCreateInstance("#messageDetailModal");
@@ -493,6 +503,11 @@ const Waya = (() => {
     const resendModal = bootstrap.Modal.getOrCreateInstance("#messageResendModal");
     let activeRow = null;
     let activeData = null;
+    let syncTimer = null;
+    let syncInFlight = false;
+    let syncCursor = 0;
+    let authWarned = false;
+    const liveIndicator = document.querySelector("#liveStatusSync");
     const selectionToolbar = document.querySelector("#messageBulkToolbar");
     function selectedRows() { return [...rows.querySelectorAll(".message-check:checked")].map((box) => box.closest("[data-message-id]")); }
     function redrawBulk() { if (!selectionToolbar) return; const selected = selectedRows(); selectionToolbar.classList.toggle("d-none", !selected.length); document.querySelector("#messageSelectedCount").textContent = `${selected.length} selected`; const all = [...rows.querySelectorAll(".message-check")]; const head = document.querySelector("#messageVisibleAll"); if (head) { head.checked = all.length && all.length === selected.length; head.indeterminate = selected.length > 0 && selected.length < all.length; } }
@@ -509,11 +524,16 @@ const Waya = (() => {
     }
 
     function renderRow(row, data) {
+      if (!row || !data) return;
       const serial = data.serial_number || row.dataset.serial;
+      const wasChecked = row.querySelector(".message-check")?.checked;
       row.dataset.serial = serial;
+      row.dataset.providerMessageId = data.provider_message_id || "";
+      row.dataset.state = data.state;
+      row.dataset.statusSyncEligible = String(Boolean(data.status_sync_eligible));
       row.classList.add("message-row-updated");
       row.innerHTML = `
-        <td><input class="message-check" type="checkbox" value="${escapeHtml(data.id)}" aria-label="Select message"></td>
+        <td><input class="message-check" type="checkbox" value="${escapeHtml(data.id)}" aria-label="Select message" ${wasChecked ? "checked" : ""}></td>
         <td class="message-serial">${escapeHtml(serial)}</td>
         <td><span class="message-phone">${escapeHtml(data.phone)}</span><button type="button" class="btn btn-sm btn-link copy-phone" data-phone="${escapeHtml(data.phone)}" aria-label="Copy phone">⧉</button></td>
         <td><button type="button" class="btn btn-link p-0 text-start message-preview" data-message-action="detail">${escapeHtml(data.message.length > 90 ? `${data.message.slice(0, 90)}…` : data.message)}</button></td>
@@ -526,6 +546,51 @@ const Waya = (() => {
           <details class="action-more"><summary class="btn btn-sm btn-outline-secondary">More</summary><div>${actionButton("update", "Update", "btn-outline-secondary", data.can_update)} ${actionButton("delete", "Delete", "btn-outline-danger", data.can_delete)} ${data.can_resend ? actionButton("resend", "Resend", "btn-warning") : ""}</div></details>
         </td>`;
       setTimeout(() => row.classList.remove("message-row-updated"), 1400);
+    }
+
+    function syncStatus(text, checking = false) {
+      if (!liveIndicator) return;
+      liveIndicator.textContent = `● Live status sync · ${text}`;
+      liveIndicator.classList.toggle("is-checking", checking);
+    }
+    function eligibleRows() {
+      return [...rows.querySelectorAll("[data-message-id]")].filter((row) =>
+        ["accepted", "pending", "sent", "delivered"].includes(row.dataset.state) && Boolean(row.dataset.providerMessageId)
+          && row.dataset.statusSyncEligible !== "false"
+      );
+    }
+    function scheduleSync(delay = 5000) {
+      clearTimeout(syncTimer);
+      if (!document.hidden && navigator.onLine) syncTimer = setTimeout(sync, delay);
+    }
+    async function sync() {
+      if (syncInFlight || document.hidden || !navigator.onLine) return;
+      const eligible = eligibleRows();
+      if (!eligible.length) { syncStatus("Up to date"); scheduleSync(); return; }
+      const selected = [];
+      for (let index = 0; index < Math.min(5, eligible.length); index += 1) selected.push(eligible[(syncCursor + index) % eligible.length]);
+      syncCursor = (syncCursor + selected.length) % eligible.length;
+      syncInFlight = true; syncStatus("Checking…", true);
+      try {
+        const data = await request("/messages/auto-sync-statuses/", { method: "POST", body: JSON.stringify({ ids: selected.map((row) => row.dataset.messageId), campaign_id: options.campaignId || undefined, limit: 5, serial_numbers: Object.fromEntries(selected.map((row) => [row.dataset.messageId, Number(row.dataset.serial)])) }) });
+        let updates = 0;
+        data.results.forEach((result) => {
+          const row = document.querySelector(`#message-${CSS.escape(result.id)}`);
+          if (row && result.row) {
+            if (result.changed) updates += 1;
+            renderRow(row, result.row);
+            if (activeRow === row && document.querySelector("#messageDetailModal")?.classList.contains("show")) loadDetail(row);
+          }
+        });
+        if (data.auth_failed) {
+          syncStatus("Provider temporarily unavailable");
+          if (!authWarned) { toast("Live delivery status is temporarily unavailable because provider authentication failed."); authWarned = true; }
+          return;
+        }
+        syncStatus(updates ? "Updated just now" : "Up to date");
+        if (updates) toast(`${updates} message status${updates === 1 ? "" : "es"} updated.`);
+      } catch (_) { syncStatus("Provider temporarily unavailable"); }
+      finally { syncInFlight = false; scheduleSync(); }
     }
 
     async function loadDetail(row, show = true) {
@@ -698,6 +763,14 @@ const Waya = (() => {
     document.querySelector("#bulkRefresh")?.addEventListener("click", () => sequential("refresh"));
     document.querySelector("#bulkDelete")?.addEventListener("click", () => sequential("delete"));
     document.querySelector("#bulkResend")?.addEventListener("click", async () => { for (const row of selectedRows()) { const button = row.querySelector('[data-message-action="resend"]'); if (!button) continue; const data = await loadDetail(row, false); try { await postAction(row, "resend", {phone:data.phone, text:data.message}); row.querySelector(".message-check").checked = false; } catch (error) { toast(error.message); } } redrawBulk(); });
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) { clearTimeout(syncTimer); syncStatus("Paused while tab is hidden"); }
+      else { sync(); }
+    });
+    window.addEventListener("online", () => { syncStatus("Checking…", true); sync(); });
+    window.addEventListener("offline", () => { clearTimeout(syncTimer); syncStatus("Offline"); });
+    window.addEventListener("pagehide", () => clearTimeout(syncTimer), { once: true });
+    sync();
   }
 
   function messagingSettings() {

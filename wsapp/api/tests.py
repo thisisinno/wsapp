@@ -549,6 +549,11 @@ class MessageLogTests(TestCase):
         self.assertEqual(normalize_message_status(None, "in_progress"), "pending")
         self.assertEqual(normalize_message_status(None, "invented"), "unknown")
 
+    def test_numeric_data_status_and_text_aliases_normalize(self):
+        self.assertEqual(normalize_message_status(3), "delivered")
+        self.assertEqual(normalize_message_status(None, "server_acknowledged"), "sent")
+        self.assertEqual(normalize_message_status(None, "failure"), "failed")
+
     def test_page_owner_scope_filters_and_serials(self):
         page = self.client.get(reverse("message_logs"))
         text = page.content.decode()
@@ -727,6 +732,51 @@ class MessageLogTests(TestCase):
         )
         self.assertEqual(response.status_code, 403)
         self.assertEqual(Campaign.objects.filter(owner=self.user).count(), 1)
+
+    @patch("api.views.WasenderClient.message_info")
+    def test_auto_sync_advances_and_returns_compact_row(self, info):
+        self.entry.state = "sent"
+        self.entry.save()
+        info.return_value = ProviderResult({"success": True, "data": {"status": 3}}, 200)
+        response = self.client.post(reverse("message_auto_sync_statuses"), data=json.dumps({"ids": [str(self.entry.id)]}), content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Cache-Control"], "no-store")
+        result = response.json()["data"]["results"][0]
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["row"]["state"], "delivered")
+        self.assertIn("campaign_counts", response.json()["data"])
+        self.entry.refresh_from_db()
+        self.assertIsNotNone(self.entry.delivered_at)
+
+    @patch("api.views.WasenderClient.message_info")
+    def test_auto_sync_throttles_and_provider_error_preserves_state(self, info):
+        self.entry.state = "sent"
+        self.entry.next_status_check_at = timezone.now() + timedelta(seconds=30)
+        self.entry.save()
+        response = self.client.post(reverse("message_auto_sync_statuses"), data=json.dumps({"ids": [str(self.entry.id)]}), content_type="application/json")
+        self.assertEqual(response.json()["data"]["checked"], 0)
+        info.assert_not_called()
+        self.entry.next_status_check_at = None
+        self.entry.save()
+        info.side_effect = WasenderError("temporary outage", 503, {})
+        response = self.client.post(reverse("message_auto_sync_statuses"), data=json.dumps({"ids": [str(self.entry.id)]}), content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        self.entry.refresh_from_db()
+        self.assertEqual(self.entry.state, "sent")
+        self.assertTrue(self.entry.status_sync_error)
+        self.assertIsNotNone(self.entry.next_status_check_at)
+
+    def test_auto_sync_requires_login_csrf_and_does_not_expose_other_rows(self):
+        url = reverse("message_auto_sync_statuses")
+        self.client.logout()
+        self.assertEqual(self.client.post(url, data="{}", content_type="application/json").status_code, 302)
+        csrf_client = Client(enforce_csrf_checks=True); csrf_client.force_login(self.user)
+        self.assertEqual(csrf_client.post(url, data="{}", content_type="application/json").status_code, 403)
+        self.client.force_login(self.user)
+        private = CampaignRecipient.objects.filter(campaign__owner=self.other).first()
+        response = self.client.post(url, data=json.dumps({"ids": [str(private.id)]}), content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["results"], [])
 
 
 class ProviderAcceptanceTests(ProviderClientTests):
