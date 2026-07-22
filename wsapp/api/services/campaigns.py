@@ -1,4 +1,5 @@
 import logging
+import hashlib
 import time
 import uuid
 from datetime import timedelta
@@ -9,10 +10,10 @@ from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
 
-from api.models import Campaign, CampaignRecipient, ImportedRecipient, MessageAttempt
+from api.models import Campaign, CampaignRecipient, ImportedRecipient, MessageAttempt, ProviderSendGate
 from api.services.media import ensure_media_ready
 from api.services.templates import render_message
-from api.services.wasender import WasenderClient, WasenderError, safe_provider_payload, safe_provider_text
+from api.services.wasender import WasenderClient, WasenderError, UnauthorizedError, safe_provider_payload, safe_provider_text
 
 logger = logging.getLogger(__name__)
 
@@ -21,23 +22,29 @@ class SendIntervalError(ValueError):
     """Raised when an untrusted send interval is invalid."""
 
 
+class CheckResult(dict):
+    """Structured result with legacy string comparison compatibility."""
+    def __eq__(self, other):
+        return self.get("state") == other if isinstance(other, str) else super().__eq__(other)
+
+
 def parse_send_interval(raw_value, *, default=None, allow_blank=False):
-    """Parse a request interval without treating a valid zero as absent."""
+    """Strict validation for user supplied values; configuration is normalized separately."""
     if raw_value is None or str(raw_value).strip() == "":
         if allow_blank:
             if default is None:
-                return 0
+                raise SendIntervalError("Send interval must be between 5 and 3600 seconds.")
             raw_value = default
         else:
-            raise SendIntervalError("Enter a whole number from 0 to 3600.")
+            raise SendIntervalError("Send interval must be between 5 and 3600 seconds.")
 
     text = str(raw_value).strip()
     if not text.isdigit():
-        raise SendIntervalError("Enter a whole number from 0 to 3600.")
+        raise SendIntervalError("Send interval must be between 5 and 3600 seconds.")
 
     value = int(text)
-    if value < 0 or value > 3600:
-        raise SendIntervalError("Send interval must be between 0 and 3600 seconds.")
+    if value < 5 or value > 3600:
+        raise SendIntervalError("Send interval must be between 5 and 3600 seconds.")
     return value
 
 
@@ -56,8 +63,7 @@ SENDABLE_STATES = ATTEMPTED_STATES | {
 }
 
 
-def normalize_send_interval(value, default=1):
-    """Clamp configuration without changing valid user choices, including zero."""
+def normalize_send_interval(value, default=5):
     try:
         value = int(value)
     except (TypeError, ValueError):
@@ -99,8 +105,42 @@ def provider_retry_seconds(exc, campaign_interval=1):
         except (TypeError, ValueError):
             continue
         if retry >= 0:
-            return retry
-    return max(campaign_interval, 1)
+            return max(5, retry, campaign_interval)
+    return max(5, campaign_interval)
+
+
+def _provider_fingerprint():
+    return hashlib.sha256(str(settings.WASENDER_API_KEY or "unconfigured").encode()).hexdigest()
+
+
+def claim_provider_send_slot(*, requested_interval, campaign_id, recipient_id):
+    """Reserve the shared provider slot before an HTTP attempt, never during it."""
+    delay = max(5, normalize_send_interval(requested_interval))
+    now = timezone.now()
+    fingerprint = _provider_fingerprint()
+    # get_or_create is deliberately outside the lock; the unique key resolves first-use races.
+    ProviderSendGate.objects.get_or_create(provider_key_fingerprint=fingerprint)
+    with transaction.atomic():
+        gate = ProviderSendGate.objects.select_for_update().get(provider_key_fingerprint=fingerprint)
+        if gate.next_allowed_at and gate.next_allowed_at > now:
+            wait = max(1, int((gate.next_allowed_at - now).total_seconds() + .999))
+            return {"claimed": False, "wait_seconds": wait, "next_allowed_at": gate.next_allowed_at}
+        gate.next_allowed_at = now + timedelta(seconds=delay)
+        gate.last_attempt_at = now
+        gate.last_campaign_id = campaign_id
+        gate.last_recipient_id = recipient_id
+        gate.save(update_fields=["next_allowed_at", "last_attempt_at", "last_campaign_id", "last_recipient_id", "updated_at"])
+    return {"claimed": True, "wait_seconds": 0, "next_allowed_at": now + timedelta(seconds=delay)}
+
+
+def extend_provider_send_gate(seconds):
+    """Keep a provider-requested 429 pause global as well."""
+    until = timezone.now() + timedelta(seconds=max(5, int(seconds)))
+    with transaction.atomic():
+        gate = ProviderSendGate.objects.select_for_update().get(provider_key_fingerprint=_provider_fingerprint())
+        if not gate.next_allowed_at or gate.next_allowed_at < until:
+            gate.next_allowed_at = until
+            gate.save(update_fields=["next_allowed_at", "updated_at"])
 
 
 def recalculate_campaign(campaign_id, finalize=True):
@@ -112,9 +152,10 @@ def recalculate_campaign(campaign_id, finalize=True):
     )
     campaign.total_count = sum(counts.values())
     campaign.queued_count = counts.get("queued", 0)
+    campaign.pending_count = counts.get("accepted", 0) + counts.get("pending", 0)
     campaign.sent_count = sum(
         counts.get(state, 0)
-        for state in ("accepted", "pending", "sent", "delivered", "read", "played")
+        for state in ("sent", "delivered", "read", "played")
     )
     campaign.delivered_count = sum(
         counts.get(state, 0) for state in ("delivered", "read", "played")
@@ -185,7 +226,7 @@ def queue_campaign_entries(campaign):
             ImportedRecipient.WhatsApp.ERROR,
         } and not campaign.allow_unknown:
             state = CampaignRecipient.State.SKIPPED
-            reason = "WhatsApp registration has not been confirmed."
+            reason = recipient.whatsapp_check_error_message if recipient.whatsapp_state == ImportedRecipient.WhatsApp.ERROR and recipient.whatsapp_check_error_message else "WhatsApp registration has not been confirmed."
         elif rendered is None:
             state = CampaignRecipient.State.SKIPPED
             reason = f"Missing values: {', '.join(missing)}"
@@ -256,32 +297,77 @@ def resume_campaign(campaign):
     return Campaign.objects.get(pk=campaign.pk)
 
 
-def check_recipient(recipient, client=None):
-    now = timezone.now()
-    fresh_after = now - timedelta(seconds=settings.WASENDER_CHECK_CACHE_SECONDS)
-    if (
-        recipient.whatsapp_checked_at
-        and recipient.whatsapp_checked_at >= fresh_after
-        and recipient.whatsapp_state
-        in {ImportedRecipient.WhatsApp.EXISTS, ImportedRecipient.WhatsApp.NOT_EXISTS}
-    ):
-        return recipient.whatsapp_state
-    try:
-        result = (client or WasenderClient()).check_number(recipient.phone_normalized)
-        data = result.data.get("data", result.data)
-        exists = bool(data.get("exists"))
-        recipient.whatsapp_state = (
-            ImportedRecipient.WhatsApp.EXISTS
-            if exists
-            else ImportedRecipient.WhatsApp.NOT_EXISTS
-        )
-    except WasenderError:
-        recipient.whatsapp_state = ImportedRecipient.WhatsApp.ERROR
-    recipient.whatsapp_checked_at = now
-    recipient.save(
-        update_fields=["whatsapp_state", "whatsapp_checked_at", "updated_at"]
+def _check_backoff(attempts, exc=None):
+    if getattr(exc, "status", None) == 429:
+        try:
+            return max(1, min(int(float(exc.retry_after)), settings.WASENDER_CHECK_MAX_INTERVAL_SECONDS))
+        except (TypeError, ValueError):
+            pass
+    if isinstance(exc, UnauthorizedError):
+        return settings.WASENDER_CHECK_MAX_INTERVAL_SECONDS
+    return 10 if attempts <= 1 else 30 if attempts == 2 else 60
+
+
+def whatsapp_checks_due(queryset, now=None):
+    """Shared selection rule; recent failures wait for their recorded backoff."""
+    now = now or timezone.now()
+    fresh = now - timedelta(seconds=settings.WASENDER_CHECK_CACHE_SECONDS)
+    stale_claim = now - timedelta(seconds=settings.WASENDER_CONNECT_TIMEOUT + settings.WASENDER_READ_TIMEOUT + 15)
+    valid = queryset.filter(phone_validation_status__in=["valid", "warning"]).exclude(phone_normalized="")
+    return valid.filter(
+        Q(whatsapp_checked_at__isnull=True)
+        | Q(whatsapp_state__in=[ImportedRecipient.WhatsApp.EXISTS, ImportedRecipient.WhatsApp.NOT_EXISTS], whatsapp_checked_at__lt=fresh)
+        | Q(whatsapp_state=ImportedRecipient.WhatsApp.ERROR, whatsapp_next_check_at__lte=now)
+        | Q(whatsapp_state=ImportedRecipient.WhatsApp.CHECKING, whatsapp_checked_at__lt=stale_claim)
     )
-    return recipient.whatsapp_state
+
+
+def check_recipient(recipient, client=None, retry_now=False):
+    """Claim, call outside the transaction, then persist a strict provider result."""
+    now = timezone.now()
+    fresh = now - timedelta(seconds=settings.WASENDER_CHECK_CACHE_SECONDS)
+    with transaction.atomic():
+        locked = ImportedRecipient.objects.select_for_update().get(pk=recipient.pk)
+        if locked.whatsapp_state in {locked.WhatsApp.EXISTS, locked.WhatsApp.NOT_EXISTS} and locked.whatsapp_checked_at and locked.whatsapp_checked_at >= fresh:
+            return CheckResult(state=locked.whatsapp_state, exists=locked.whatsapp_state == locked.WhatsApp.EXISTS, checked=False, cached=True, wait_seconds=0)
+        if locked.whatsapp_state == locked.WhatsApp.CHECKING and locked.whatsapp_checked_at and locked.whatsapp_checked_at > now - timedelta(seconds=settings.WASENDER_CONNECT_TIMEOUT + settings.WASENDER_READ_TIMEOUT + 15):
+            return CheckResult(state="checking", checked=False, busy=True, wait_seconds=2)
+        if not retry_now and locked.whatsapp_state == locked.WhatsApp.ERROR and locked.whatsapp_next_check_at and locked.whatsapp_next_check_at > now:
+            return CheckResult(state="error", checked=False, waiting_retry=True, wait_seconds=max(1, int((locked.whatsapp_next_check_at - now).total_seconds() + .999)))
+        locked.whatsapp_state = locked.WhatsApp.CHECKING
+        locked.whatsapp_checked_at = now
+        locked.save(update_fields=["whatsapp_state", "whatsapp_checked_at", "updated_at"])
+    try:
+        result = (client or WasenderClient()).check_number(locked.phone_normalized)
+    except WasenderError as exc:
+        with transaction.atomic():
+            locked = ImportedRecipient.objects.select_for_update().get(pk=recipient.pk)
+            attempts = locked.whatsapp_check_attempts + 1
+            delay = _check_backoff(attempts, exc)
+            locked.whatsapp_state = locked.WhatsApp.ERROR
+            locked.whatsapp_checked_at = timezone.now()
+            locked.whatsapp_check_attempts = attempts
+            locked.whatsapp_check_error_code = exc.category
+            locked.whatsapp_check_error_message = safe_provider_text(exc)[:255] or "Provider registration check failed."
+            locked.whatsapp_check_http_status = exc.status
+            locked.whatsapp_next_check_at = locked.whatsapp_checked_at + timedelta(seconds=delay)
+            locked.whatsapp_last_payload = safe_provider_payload(exc.payload)
+            locked.save()
+        return CheckResult(state="error", exists=None, checked=True, error_code=exc.category, error_message=locked.whatsapp_check_error_message, http_status=exc.status, retry_after=delay, wait_seconds=delay, authentication_error=isinstance(exc, UnauthorizedError))
+    with transaction.atomic():
+        locked = ImportedRecipient.objects.select_for_update().get(pk=recipient.pk)
+        exists = result.exists if hasattr(result, "exists") else result.data.get("data", {}).get("exists")
+        if not isinstance(exists, bool):
+            raise WasenderError("Provider returned an invalid registration-check response.")
+        locked.whatsapp_state = locked.WhatsApp.EXISTS if exists else locked.WhatsApp.NOT_EXISTS
+        locked.whatsapp_checked_at = timezone.now()
+        locked.whatsapp_check_attempts += 1
+        locked.whatsapp_check_http_status = result.http_status
+        locked.whatsapp_last_payload = safe_provider_payload(getattr(result, "provider_payload", result.data))
+        locked.whatsapp_check_error_code = locked.whatsapp_check_error_message = ""
+        locked.whatsapp_next_check_at = None
+        locked.save()
+    return CheckResult(state=locked.whatsapp_state, exists=exists, checked=True, error_code="", error_message="", http_status=result.http_status, retry_after=0, wait_seconds=settings.WASENDER_CHECK_INTERVAL_SECONDS)
 
 
 def recover_stale_processing(campaign_id):
@@ -338,23 +424,7 @@ def send_next(campaign_id, owner_id, run_token):
         ).exists()
         if busy:
             return {"busy": True, "retry_after": 2}
-        latest = (
-            MessageAttempt.objects.filter(
-                campaign_recipient__campaign__owner_id=owner_id,
-                campaign_recipient__attempt_started_at__isnull=False,
-            )
-            .order_by("-campaign_recipient__attempt_started_at")
-            .first()
-        )
         interval = campaign_interval_seconds(campaign)
-        if latest and interval:
-            next_allowed = latest.campaign_recipient.attempt_started_at + timedelta(seconds=interval)
-            if next_allowed > now:
-                return {
-                    "wait_seconds": max(
-                        1, int((next_allowed - now).total_seconds() + 0.999)
-                    )
-                }
         entry = (
             campaign.campaign_recipients.select_for_update()
             .filter(state=CampaignRecipient.State.QUEUED)
@@ -364,6 +434,12 @@ def send_next(campaign_id, owner_id, run_token):
         if not entry:
             recalculate_campaign(campaign.id)
             return {"finished": True}
+        claim = claim_provider_send_slot(
+            requested_interval=interval, campaign_id=campaign.id, recipient_id=entry.id
+        )
+        if not claim["claimed"]:
+            return {"wait_seconds": claim["wait_seconds"], "next_allowed_at": claim["next_allowed_at"].isoformat(),
+                    "message": "The provider queue requires a 5-second interval."}
         entry.state = CampaignRecipient.State.PROCESSING
         entry.attempt_started_at = now
         entry.attempt_finished_at = None
@@ -400,30 +476,17 @@ def send_next(campaign_id, owner_id, run_token):
             media_url,
             media.original_filename if campaign.media and media_field == "documentUrl" else None,
         )
-        data = provider.data.get("data", {})
-        safe_payload = _safe_provider_payload(provider.data)
-        with transaction.atomic():
-            locked = CampaignRecipient.objects.select_for_update().get(pk=entry.pk)
-            locked.state = CampaignRecipient.State.ACCEPTED
-            locked.provider_message_id = str(data.get("msgId") or data.get("id") or "")
-            locked.provider_jid = str(data.get("jid", ""))
-            locked.attempt_finished_at = timezone.now()
-            locked.skip_reason = ""
-            # A successful HTTP request is only acceptance.  Apply any stronger
-            # acknowledgement actually returned by the provider.
-            from api.services.message_logs import apply_provider_status
-            apply_provider_status(locked, provider.data, checked_at=timezone.now())
-            attempt.http_status = provider.http_status
-            attempt.provider_response = safe_payload
-            attempt.provider_message_id = locked.provider_message_id
-            attempt.duration_ms = int((time.monotonic() - started) * 1000)
-            attempt.save()
+        from api.services.message_logs import apply_send_result
+        apply_send_result(entry.id, provider, attempt_id=attempt.id,
+                          finished_at=timezone.now(), duration_ms=int((time.monotonic() - started) * 1000))
         result_name = "accepted"
     except WasenderError as exc:
         with transaction.atomic():
             locked = CampaignRecipient.objects.select_for_update().get(pk=entry.pk)
             is_rate_limited = provider_rate_limited(exc)
             retry_seconds = provider_retry_seconds(exc, campaign_interval_seconds(campaign)) if is_rate_limited else 0
+            if is_rate_limited:
+                extend_provider_send_gate(retry_seconds)
             locked.state = CampaignRecipient.State.QUEUED if is_rate_limited else CampaignRecipient.State.FAILED
             locked.failed_at = None if is_rate_limited else timezone.now()
             locked.attempt_finished_at = timezone.now()
@@ -502,19 +565,16 @@ def preflight_next(campaign_id, owner_id, run_token):
             return {"conflict": True}
         if campaign.status != Campaign.Status.CHECKING:
             return {"inactive": True}
+        if campaign.preflight_checked >= campaign.preflight_limit:
+            campaign.status = Campaign.Status.READY
+            campaign.save(update_fields=["status", "updated_at"])
+            return {"finished": True, "limit_reached": True}
         recipient = (
-            campaign.dataset.recipients.select_for_update()
+            whatsapp_checks_due(campaign.dataset.recipients.select_for_update())
             .filter(
                 selected=True,
                 phone_validation_status__in=["valid", "warning"],
                 suppressed=False,
-            )
-            .filter(
-                Q(whatsapp_checked_at__isnull=True)
-                | Q(
-                    whatsapp_checked_at__lt=timezone.now()
-                    - timedelta(seconds=settings.WASENDER_CHECK_CACHE_SECONDS)
-                )
             )
             .order_by("original_row_number")
             .first()
@@ -523,10 +583,16 @@ def preflight_next(campaign_id, owner_id, run_token):
             campaign.status = Campaign.Status.READY
             campaign.save(update_fields=["status", "updated_at"])
             return {"finished": True}
-    state = check_recipient(recipient)
+    result = check_recipient(recipient)
+    with transaction.atomic():
+        campaign = Campaign.objects.select_for_update().get(pk=campaign_id)
+        campaign.preflight_checked = min(campaign.preflight_checked + (1 if result.get("checked") else 0), campaign.preflight_limit)
+        campaign.save(update_fields=["preflight_checked", "updated_at"])
     return {
-        "checked_now": True,
+        "checked_now": result.get("checked", False),
         "recipient_id": str(recipient.id),
-        "result": state,
-        "wait_seconds": settings.WASENDER_CHECK_INTERVAL_SECONDS,
+        "result": result.get("state"),
+        "wait_seconds": result.get("wait_seconds", settings.WASENDER_CHECK_INTERVAL_SECONDS),
+        "checked": campaign.preflight_checked,
+        "total": campaign.preflight_total,
     }

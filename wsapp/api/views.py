@@ -23,7 +23,7 @@ from .services.imports import checksum, workbook_sheets
 from .services.campaigns import (
     ATTEMPTED_STATES,
     SENDABLE_STATES,
-    check_recipient, preflight_next,
+    check_recipient, preflight_next, whatsapp_checks_due,
     queue_campaign_entries,
     recalculate_campaign,
     resume_campaign,
@@ -195,7 +195,8 @@ def recipients(request, dataset_id):
     page, size = max(1, int(request.GET.get("page", 1))), min(100, max(1, int(request.GET.get("page_size", 25))))
     total = queryset.distinct().count()
     rows = queryset.distinct()[(page - 1) * size:page * size]
-    data = [{"id": str(r.id), "row_number": r.original_row_number, "row": r.row_data, "phone_original": r.phone_original, "phone_normalized": r.phone_normalized, "validation": r.phone_validation_status, "error": r.validation_error_message, "selected": r.selected, "whatsapp": r.whatsapp_state, "whatsapp_error": r.validation_error_message if r.whatsapp_state == "error" else "", "duplicate": bool(r.duplicate_of_id), "suppressed": r.suppressed} for r in rows]
+    now = timezone.now()
+    data = [{"id": str(r.id), "row_number": r.original_row_number, "row": r.row_data, "phone_original": r.phone_original, "phone_normalized": r.phone_normalized, "validation": r.phone_validation_status, "error": r.validation_error_message, "selected": r.selected, "whatsapp": r.whatsapp_state, "whatsapp_error_code": r.whatsapp_check_error_code, "whatsapp_error": r.whatsapp_check_error_message, "whatsapp_http_status": r.whatsapp_check_http_status, "whatsapp_next_check_at": r.whatsapp_next_check_at.isoformat() if r.whatsapp_next_check_at else None, "whatsapp_retry_seconds": max(0, int((r.whatsapp_next_check_at - now).total_seconds() + .999)) if r.whatsapp_next_check_at else 0, "duplicate": bool(r.duplicate_of_id), "suppressed": r.suppressed} for r in rows]
     return ok({"rows": data, "page": page, "page_size": size, "total": total, "counts": recipient_counts(dataset)})
 
 
@@ -213,6 +214,11 @@ def edit_phone(request, recipient_id):
     recipient.suppressed = bool(result.normalized and request.user.suppressions.filter(normalized_phone=result.normalized).exists())
     recipient.whatsapp_state = ImportedRecipient.WhatsApp.UNKNOWN
     recipient.whatsapp_checked_at = None
+    recipient.whatsapp_check_error_code = recipient.whatsapp_check_error_message = ""
+    recipient.whatsapp_check_http_status = None
+    recipient.whatsapp_check_attempts = 0
+    recipient.whatsapp_next_check_at = None
+    recipient.whatsapp_last_payload = {}
     recipient.save()
     return ok({"id": str(recipient.id), "old": old, "new": new, "normalized": result.normalized, "validation": result.status, "error": result.message, "whatsapp": recipient.whatsapp_state, "should_check": result.status in {"valid", "warning"} and bool(result.normalized) and preference_for(request.user).auto_check_whatsapp_after_normalization, "counts": recipient_counts(recipient.dataset)})
 
@@ -231,6 +237,13 @@ def bulk_edit_phones(request, dataset_id):
             recipient.phone_validation_status, recipient.validation_error_code = result.status, result.code
             recipient.validation_error_message, recipient.auto_corrected = result.message, result.auto_corrected
             recipient.row_data[recipient.phone_source_column] = item.get("phone", "")
+            recipient.whatsapp_state = ImportedRecipient.WhatsApp.UNKNOWN
+            recipient.whatsapp_checked_at = None
+            recipient.whatsapp_check_error_code = recipient.whatsapp_check_error_message = ""
+            recipient.whatsapp_check_http_status = None
+            recipient.whatsapp_check_attempts = 0
+            recipient.whatsapp_next_check_at = None
+            recipient.whatsapp_last_payload = {}
             recipient.save()
             results.append({"id": str(recipient.id), "normalized": result.normalized, "validation": result.status, "error": result.message})
     return ok({"items": results, "counts": recipient_counts(dataset)}, "Corrections saved.")
@@ -270,12 +283,18 @@ def whatsapp_check_start(request, dataset_id):
 
 
 def whatsapp_progress(dataset):
-    fresh = timezone.now() - timedelta(seconds=settings.WASENDER_CHECK_CACHE_SECONDS)
+    now = timezone.now()
+    fresh = now - timedelta(seconds=settings.WASENDER_CHECK_CACHE_SECONDS)
     eligible = dataset.recipients.filter(phone_validation_status__in=["valid", "warning"]).exclude(phone_normalized="")
     total = eligible.count()
-    checked = eligible.filter(whatsapp_checked_at__gte=fresh, whatsapp_state__in=["exists", "not_exists"]).count()
-    pending = eligible.filter(Q(whatsapp_checked_at__isnull=True) | Q(whatsapp_checked_at__lt=fresh) | Q(whatsapp_state="error")).count()
-    return {"total": total, "checked": checked, "pending": pending, "paused": dataset.whatsapp_check_paused, "percent": round(checked * 100 / total, 1) if total else 100}
+    exists = eligible.filter(whatsapp_state="exists", whatsapp_checked_at__gte=fresh).count()
+    not_exists = eligible.filter(whatsapp_state="not_exists", whatsapp_checked_at__gte=fresh).count()
+    errors = eligible.filter(whatsapp_state="error").count()
+    waiting = eligible.filter(whatsapp_state="error", whatsapp_next_check_at__gt=now).count()
+    checking = eligible.filter(whatsapp_state="checking").count()
+    pending = whatsapp_checks_due(eligible, now).count()
+    confirmed = exists + not_exists
+    return {"total": total, "checked": confirmed, "confirmed": confirmed, "exists": exists, "not_exists": not_exists, "errors": errors, "checking": checking, "waiting_retry": waiting, "pending": pending, "paused": dataset.whatsapp_check_paused, "percent": round(confirmed * 100 / total, 1) if total else 100}
 
 
 @login_required
@@ -299,16 +318,25 @@ def whatsapp_check_next(request, dataset_id):
     dataset = get_object_or_404(UploadedDataset, pk=dataset_id, owner=request.user)
     if dataset.whatsapp_check_paused:
         return ok({**whatsapp_progress(dataset), "paused": True})
-    fresh = timezone.now() - timedelta(seconds=settings.WASENDER_CHECK_CACHE_SECONDS)
     with transaction.atomic():
-        recipient = dataset.recipients.select_for_update().filter(phone_validation_status__in=["valid", "warning"]).exclude(phone_normalized="").filter(Q(whatsapp_checked_at__isnull=True) | Q(whatsapp_checked_at__lt=fresh) | Q(whatsapp_state="error")).order_by("original_row_number").first()
+        recipient = whatsapp_checks_due(dataset.recipients.select_for_update()).order_by("original_row_number").first()
         if not recipient:
             return ok({**whatsapp_progress(dataset), "finished": True})
-        recipient.whatsapp_state = ImportedRecipient.WhatsApp.CHECKING
-        recipient.save(update_fields=["whatsapp_state", "updated_at"])
-    state = check_recipient(recipient)
+    result = check_recipient(recipient)
     recipient.refresh_from_db()
-    return ok({**whatsapp_progress(dataset), "recipient": {"id": str(recipient.id), "whatsapp": state, "error": recipient.validation_error_message if state == "error" else ""}, "checked_now": True})
+    return ok({**whatsapp_progress(dataset), "recipient": {"id": str(recipient.id), "whatsapp": recipient.whatsapp_state, "whatsapp_error_code": recipient.whatsapp_check_error_code, "error": recipient.whatsapp_check_error_message, "http_status": recipient.whatsapp_check_http_status}, "checked_now": result.get("checked", False), "wait_seconds": result.get("wait_seconds", settings.WASENDER_CHECK_INTERVAL_SECONDS), "authentication_error": result.get("authentication_error", False)})
+
+
+@login_required
+@require_POST
+def check_recipient_whatsapp(request, recipient_id):
+    recipient = get_object_or_404(ImportedRecipient, pk=recipient_id, owner=request.user)
+    retry_now = bool(json_body(request).get("retry_now"))
+    if retry_now:
+        ImportedRecipient.objects.filter(pk=recipient.pk).update(whatsapp_next_check_at=None)
+    result = check_recipient(recipient, retry_now=retry_now)
+    recipient.refresh_from_db()
+    return ok({**result, "recipient": {"id": str(recipient.id), "whatsapp": recipient.whatsapp_state, "whatsapp_error_code": recipient.whatsapp_check_error_code, "whatsapp_error": recipient.whatsapp_check_error_message, "whatsapp_http_status": recipient.whatsapp_check_http_status}})
 
 
 @login_required
@@ -423,12 +451,15 @@ def campaign_preflight(request, campaign_id):
     eligible = campaign.dataset.recipients.filter(
         selected=True, phone_validation_status__in=["valid", "warning"], suppressed=False
     )
-    count = min(eligible.count(), settings.WASENDER_MAX_CHECKS_PER_CAMPAIGN)
+    due = whatsapp_checks_due(eligible)
+    count = min(due.count(), settings.WASENDER_MAX_CHECKS_PER_CAMPAIGN)
     if not count:
         return error("No eligible recipients are available for preflight.")
     campaign.run_token = uuid.uuid4().hex
     campaign.status = Campaign.Status.CHECKING
-    campaign.save(update_fields=["run_token", "status", "updated_at"])
+    campaign.preflight_total = campaign.preflight_limit = count
+    campaign.preflight_checked = 0
+    campaign.save(update_fields=["run_token", "status", "preflight_total", "preflight_limit", "preflight_checked", "updated_at"])
     return ok(
         {"run_token": campaign.run_token, "total": count, "checked": 0},
         "Preflight ready.",
@@ -570,7 +601,7 @@ def campaign_progress_data(campaign):
         "progress_text": f"{processed}/{sendable_total}",
         "percent": round(processed / sendable_total * 100, 1) if sendable_total else 0,
         "queued": states.get("queued", 0), "processing": states.get("processing", 0),
-        "accepted": accepted, "sent": states.get("sent", 0), "delivered": states.get("delivered", 0),
+        "accepted": accepted, "pending": accepted, "sent": states.get("sent", 0) + states.get("delivered", 0) + states.get("read", 0) + states.get("played", 0), "delivered": states.get("delivered", 0) + states.get("read", 0) + states.get("played", 0),
         "read": states.get("read", 0) + states.get("played", 0), "failed": states.get("failed", 0),
         "skipped": states.get("skipped", 0), "invalid": states.get("invalid", 0),
         "cancelled": states.get("cancelled", 0), "next_send_at": next_send_at.isoformat() if next_send_at else None,

@@ -42,7 +42,7 @@ class UploadedDataset(UUIDTimeModel):
 
 class MessagingPreference(UUIDTimeModel):
     owner = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="messaging_preference")
-    default_send_interval_seconds = models.PositiveIntegerField(default=1, validators=[MinValueValidator(0), MaxValueValidator(3600)])
+    default_send_interval_seconds = models.PositiveIntegerField(default=5, validators=[MinValueValidator(5), MaxValueValidator(3600)])
     auto_check_whatsapp_after_normalization = models.BooleanField(default=True)
 
 
@@ -76,11 +76,17 @@ class ImportedRecipient(UUIDTimeModel):
     auto_corrected = models.BooleanField(default=False)
     whatsapp_state = models.CharField(max_length=20, choices=WhatsApp.choices, default=WhatsApp.UNKNOWN)
     whatsapp_checked_at = models.DateTimeField(null=True, blank=True)
+    whatsapp_check_error_code = models.CharField(max_length=50, blank=True)
+    whatsapp_check_error_message = models.CharField(max_length=255, blank=True)
+    whatsapp_check_http_status = models.PositiveSmallIntegerField(null=True, blank=True)
+    whatsapp_check_attempts = models.PositiveIntegerField(default=0)
+    whatsapp_next_check_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    whatsapp_last_payload = models.JSONField(default=dict, blank=True)
     duplicate_of = models.ForeignKey("self", null=True, blank=True, on_delete=models.SET_NULL, related_name="duplicates")
     suppressed = models.BooleanField(default=False)
     class Meta:
         constraints = [models.UniqueConstraint(fields=["dataset", "original_row_number"], name="unique_dataset_row")]
-        indexes = [models.Index(fields=["owner", "phone_normalized"]), models.Index(fields=["dataset", "selected"])]
+        indexes = [models.Index(fields=["owner", "phone_normalized"]), models.Index(fields=["dataset", "selected"]), models.Index(fields=["dataset", "whatsapp_state"], name="api_rec_dataset_wsstate"), models.Index(fields=["dataset", "whatsapp_next_check_at"], name="api_rec_dataset_wsnext")]
 
 
 class UploadedMedia(UUIDTimeModel):
@@ -121,7 +127,7 @@ class Campaign(UUIDTimeModel):
     body_snapshot = models.TextField()
     selected_phone_column = models.CharField(max_length=255)
     selected_recipient_count = models.PositiveIntegerField(default=0)
-    send_interval_seconds = models.PositiveIntegerField(default=1, validators=[MinValueValidator(0), MaxValueValidator(3600)])
+    send_interval_seconds = models.PositiveIntegerField(default=5, validators=[MinValueValidator(5), MaxValueValidator(3600)])
     media = models.ForeignKey(UploadedMedia, null=True, blank=True, on_delete=models.SET_NULL)
     status = models.CharField(max_length=30, choices=Status.choices, default=Status.DRAFT)
     missing_value_policy = models.CharField(max_length=20, default="empty")
@@ -131,6 +137,7 @@ class Campaign(UUIDTimeModel):
     opt_in_confirmed = models.BooleanField(default=False)
     total_count = models.PositiveIntegerField(default=0)
     queued_count = models.PositiveIntegerField(default=0)
+    pending_count = models.PositiveIntegerField(default=0)
     sent_count = models.PositiveIntegerField(default=0)
     delivered_count = models.PositiveIntegerField(default=0)
     read_count = models.PositiveIntegerField(default=0)
@@ -144,6 +151,9 @@ class Campaign(UUIDTimeModel):
     last_progress_at = models.DateTimeField(null=True, blank=True)
     last_enqueued_at = models.DateTimeField(null=True, blank=True)
     run_token = models.CharField(max_length=64, blank=True, default="")
+    preflight_total = models.PositiveIntegerField(default=0)
+    preflight_checked = models.PositiveIntegerField(default=0)
+    preflight_limit = models.PositiveIntegerField(default=0)
 
 
 class CampaignRecipient(UUIDTimeModel):
@@ -201,6 +211,16 @@ class MessageAttempt(UUIDTimeModel):
     duration_ms = models.PositiveIntegerField(default=0)
     class Meta:
         constraints = [models.UniqueConstraint(fields=["campaign_recipient", "attempt_number"], name="unique_attempt_number")]
+
+
+class ProviderSendGate(models.Model):
+    """One row per shared provider credential; contains no credential itself."""
+    provider_key_fingerprint = models.CharField(max_length=64, unique=True)
+    next_allowed_at = models.DateTimeField(null=True, blank=True)
+    last_attempt_at = models.DateTimeField(null=True, blank=True)
+    last_campaign_id = models.UUIDField(null=True, blank=True)
+    last_recipient_id = models.UUIDField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
 
 class WebhookEvent(UUIDTimeModel):

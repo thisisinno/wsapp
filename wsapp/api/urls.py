@@ -10,6 +10,7 @@ urlpatterns = [
     path("uploads/<uuid:dataset_id>/columns/", views.columns, name="columns"),
     path("uploads/<uuid:dataset_id>/select-phone-column/", views.select_phone_column, name="select_phone_column"),
     path("recipients/<uuid:recipient_id>/edit-phone/", views.edit_phone, name="edit_phone"),
+    path("recipients/<uuid:recipient_id>/check-whatsapp/", views.check_recipient_whatsapp, name="check_recipient_whatsapp"),
     path("datasets/<uuid:dataset_id>/recipients/", views.recipients, name="recipients"),
     path("datasets/<uuid:dataset_id>/bulk-edit/", views.bulk_edit_phones, name="bulk_edit_phones"),
     path("datasets/<uuid:dataset_id>/selection/", views.selection, name="selection"),

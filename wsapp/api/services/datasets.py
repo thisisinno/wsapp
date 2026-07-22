@@ -61,6 +61,13 @@ def normalize_dataset(dataset_id, column):
             recipient.auto_corrected = result.auto_corrected
             recipient.suppressed = result.normalized in suppressions
             recipient.duplicate_of = seen.get(result.normalized) if result.normalized else None
+            recipient.whatsapp_state = ImportedRecipient.WhatsApp.UNKNOWN
+            recipient.whatsapp_checked_at = None
+            recipient.whatsapp_check_error_code = recipient.whatsapp_check_error_message = ""
+            recipient.whatsapp_check_http_status = None
+            recipient.whatsapp_check_attempts = 0
+            recipient.whatsapp_next_check_at = None
+            recipient.whatsapp_last_payload = {}
             recipient.save()
             if result.normalized and result.normalized not in seen:
                 seen[result.normalized] = recipient

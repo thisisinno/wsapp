@@ -53,18 +53,18 @@ const Waya = (() => {
     bootstrap.Toast.getOrCreateInstance(node).show();
   }
 
-  function parseIntervalInput(input, { fallback = 0, allowBlank = true } = {}) {
+  function parseIntervalInput(input, { fallback = 5, allowBlank = true } = {}) {
     const raw = String(input?.value ?? "").trim();
 
     if (raw === "") {
-      return { valid: allowBlank, value: allowBlank ? Number(fallback) : null, blank: true, message: allowBlank ? "" : "Enter a whole number from 0 to 3600." };
+      return { valid: allowBlank, value: allowBlank ? Number(fallback) : null, blank: true, message: allowBlank ? "" : "Send interval must be between 5 and 3600 seconds." };
     }
     if (!/^(0|[1-9]\d*)$/.test(raw)) {
-      return { valid: false, value: null, blank: false, message: "Enter a whole number from 0 to 3600." };
+      return { valid: false, value: null, blank: false, message: "Send interval must be between 5 and 3600 seconds." };
     }
     const value = Number(raw);
-    if (!Number.isSafeInteger(value) || value < 0 || value > 3600) {
-      return { valid: false, value: null, blank: false, message: "Send interval must be between 0 and 3600 seconds." };
+    if (!Number.isSafeInteger(value) || value < 5 || value > 3600) {
+      return { valid: false, value: null, blank: false, message: "Send interval must be between 5 and 3600 seconds." };
     }
     return { valid: true, value, blank: false, message: "" };
   }
@@ -127,16 +127,20 @@ const Waya = (() => {
     }
 
     function whatsappBadge(row) {
-      const states = { exists: ["success", "Registered"], not_exists: ["danger", "Not on WhatsApp"], checking: ["primary", "Checking…"], error: ["warning", "Check error"], unknown: ["secondary", "Unchecked"] };
+      const states = { exists: ["success", "Registered"], not_exists: ["danger", "Not on WhatsApp"], checking: ["primary", "Checking…"], error: [row.whatsapp_retry_seconds ? "secondary" : "warning", row.whatsapp_retry_seconds ? "Waiting to retry" : "Check failed"], unknown: ["secondary", "Unchecked"] };
       const value = states[row.whatsapp] || states.unknown;
-      return `<span class="badge text-bg-${value[0]}" title="${escapeHtml(row.whatsapp_error || "")}">${value[1]}</span>`;
+      return `<button type="button" class="badge text-bg-${value[0]} border-0" data-check-detail="${row.id}" title="${escapeHtml(row.whatsapp_error || "")}">${value[1]}</button>`;
     }
 
     function updateHeader() { const checks = [...document.querySelectorAll(".row-check")]; $("#visibleAll").checked = checks.length && checks.every((node) => node.checked); $("#visibleAll").indeterminate = checks.some((node) => node.checked) && !$("#visibleAll").checked; }
 
-    async function whatsappProgress() { const data = await request(`/uploads/${id}/whatsapp-check/progress/`); $("#whatsappProgress").textContent = `Checked ${data.checked}/${data.total}${data.paused ? " · Paused" : ""}`; $("#whatsappProgressBar").style.width = `${data.percent}%`; return data; }
-    let checking = false;
-    async function checkLoop() { if (checking) return; checking = true; try { while (true) { const p = await whatsappProgress(); if (p.paused || !p.pending) break; const data = await request(`/uploads/${id}/whatsapp-check/next/`, {method:"POST", body:"{}"}); if (data.finished || data.paused) break; await load(); } } catch (error) { toast(error.message); } finally { checking = false; await whatsappProgress().catch(() => {}); } }
+    async function whatsappProgress() { const data = await request(`/uploads/${id}/whatsapp-check/progress/`); $("#whatsappProgress").textContent = `Confirmed ${data.confirmed}/${data.total} · ${data.pending} pending${data.waiting_retry ? ` · ${data.waiting_retry} waiting` : ""}${data.paused ? " · Paused" : ""}`; $("#whatsappProgressBar").style.width = `${data.percent}%`; return data; }
+    let checkTimer = null;
+    let checkInFlight = false;
+    let checksPausedByError = false;
+    function scheduleCheck(seconds = 0) { clearTimeout(checkTimer); if (document.hidden || !navigator.onLine || checksPausedByError) return; checkTimer = setTimeout(runNextCheck, Math.max(0, seconds) * 1000); }
+    function patchRecipient(updated) { const index = rows.findIndex((row) => row.id === updated.id); if (index >= 0) { rows[index] = {...rows[index], ...updated}; const badge = document.querySelector(`[data-check-detail="${updated.id}"]`); if (badge) badge.outerHTML = whatsappBadge(rows[index]); } }
+    async function runNextCheck() { if (checkInFlight || document.hidden || !navigator.onLine || checksPausedByError) return; checkInFlight = true; try { const progress = await whatsappProgress(); if (progress.paused || !progress.pending) return; const data = await request(`/uploads/${id}/whatsapp-check/next/`, {method:"POST", body:"{}"}); if (data.recipient) patchRecipient({id:data.recipient.id, whatsapp:data.recipient.whatsapp, whatsapp_error:data.recipient.error, whatsapp_error_code:data.recipient.whatsapp_error_code, whatsapp_http_status:data.recipient.http_status}); await whatsappProgress(); if (data.authentication_error) { checksPausedByError = true; toast("WhatsApp provider authentication failed. Checks are paused."); return; } if (!data.finished && !data.paused) scheduleCheck(data.wait_seconds || 0); } catch (error) { toast(error.message); } finally { checkInFlight = false; } }
 
     async function columns() {
       const data = await request(`/uploads/${id}/columns/`);
@@ -178,12 +182,14 @@ const Waya = (() => {
       badges(result);
       $("#composeCampaignButton").classList.remove("disabled"); $("#composeCampaignButton").removeAttribute("aria-disabled"); $("#phoneColumnHelp").textContent = "Phone column selected";
       await load();
-      if (result.auto_check) { await request(`/uploads/${id}/whatsapp-check/start/`, {method:"POST", body:"{}"}); checkLoop(); }
+      if (result.auto_check) { await request(`/uploads/${id}/whatsapp-check/start/`, {method:"POST", body:"{}"}); scheduleCheck(0); }
       toast("Numbers normalized.");
     };
     $("#filter").onchange = (event) => { filter = event.target.value; page = 1; load(); };
     $("#more").onclick = () => { page += 1; load(); };
     $("#recipientRows").onclick = (event) => {
+      const detailId = event.target.dataset.checkDetail;
+      if (detailId) { const row = rows.find((item) => item.id === detailId); if (row && row.whatsapp === "error") { if (confirm(`${row.whatsapp_error || "Registration check failed."}\nRetry this number now?`)) { event.target.disabled = true; request(`/recipients/${detailId}/check-whatsapp/`, {method:"POST", body:JSON.stringify({retry_now:true})}).then((data) => { patchRecipient(data.recipient); whatsappProgress(); }).catch((error) => toast(error.message)).finally(() => { event.target.disabled = false; }); } } return; }
       const recipientId = event.target.dataset.edit;
       if (!recipientId) return;
       const row = rows.find((item) => item.id === recipientId);
@@ -213,7 +219,7 @@ const Waya = (() => {
     $("#selectValid").onclick = () => request(`/datasets/${id}/selection/`, {method:"POST", body:JSON.stringify({action:"valid"})}).then(load);
     $("#selectWhatsApp").onclick = () => request(`/datasets/${id}/selection/`, {method:"POST", body:JSON.stringify({action:"whatsapp_exists"})}).then(load);
     $("#pauseWhatsAppChecks").onclick = () => request(`/uploads/${id}/whatsapp-check/pause/`, {method:"POST", body:"{}"}).then(whatsappProgress);
-    $("#resumeWhatsAppChecks").onclick = async () => { await request(`/uploads/${id}/whatsapp-check/start/`, {method:"POST", body:"{}"}); checkLoop(); };
+    $("#resumeWhatsAppChecks").onclick = async () => { checksPausedByError = false; await request(`/uploads/${id}/whatsapp-check/start/`, {method:"POST", body:"{}"}); scheduleCheck(0); };
     $("#phoneForm").onsubmit = async (event) => {
       event.preventDefault();
       try {
@@ -222,7 +228,7 @@ const Waya = (() => {
         });
         modal.hide();
         await load();
-        if (data.should_check) { await request(`/uploads/${id}/whatsapp-check/start/`, {method:"POST", body:"{}"}); checkLoop(); }
+        if (data.should_check) { await request(`/uploads/${id}/whatsapp-check/start/`, {method:"POST", body:"{}"}); scheduleCheck(0); }
         toast("Correction saved.");
       } catch (error) {
         $("#phoneError").textContent = error.message;
@@ -231,7 +237,10 @@ const Waya = (() => {
     };
     columns();
     load();
-    whatsappProgress().then((data) => { if (data.pending && !data.paused) checkLoop(); }).catch(() => {});
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) scheduleCheck(0); });
+    window.addEventListener("online", () => scheduleCheck(0));
+    window.addEventListener("pagehide", () => clearTimeout(checkTimer), {once:true});
+    whatsappProgress().then((data) => { if (data.pending && !data.paused) scheduleCheck(0); }).catch(() => {});
   }
 
   function campaignForm(id) {
@@ -647,6 +656,14 @@ const Waya = (() => {
       if (badge) { const text = `● ${patch.state_label}`; if (badge.textContent !== text) { badge.textContent = text; badge.className = `app-status app-status--${patch.state} status-badge-updated`; setTimeout(() => badge.classList.remove("status-badge-updated"), 200); } }
       if (activeRow === row && document.querySelector("#messageDetailModal")?.classList.contains("show")) patchDetailStatus(patch);
     }
+    function patchCampaignCounts(counts) {
+      if (!counts) return;
+      setTextIfChanged(document.querySelector("#accepted"), counts.pending);
+      setTextIfChanged(document.querySelector("#sent"), counts.sent);
+      setTextIfChanged(document.querySelector("#delivered"), counts.delivered);
+      setTextIfChanged(document.querySelector("#read"), counts.read);
+      setTextIfChanged(document.querySelector("#failed"), counts.failed);
+    }
 
     function syncStatus(text, checking = false) {
       if (!liveIndicator) return;
@@ -674,7 +691,7 @@ const Waya = (() => {
       try {
         const data = await request("/messages/auto-sync-statuses/", { method: "POST", body: JSON.stringify({ ids: selected.map((row) => row.dataset.messageId), campaign_id: options.campaignId || undefined, limit: 5, serial_numbers: Object.fromEntries(selected.map((row) => [row.dataset.messageId, Number(row.dataset.serial)])) }) });
         const patches = data.results.filter((result) => result.changed && result.patch);
-        requestAnimationFrame(() => patches.forEach((result) => patchMessageStatus(rows.querySelector(`#message-${CSS.escape(result.id)}`), result.patch)));
+        requestAnimationFrame(() => patches.forEach((result) => { patchMessageStatus(rows.querySelector(`#message-${CSS.escape(result.id)}`), result.patch); patchCampaignCounts(result.campaign_counts); }));
         if (data.auth_failed) {
           if (!authWarned) { toast("Live delivery status is temporarily unavailable because provider authentication failed."); authWarned = true; }
           return;

@@ -7,7 +7,7 @@ from django.db.models import Count
 from django.utils import timezone
 
 from api.models import CampaignRecipient, MessageAttempt
-from api.services.campaigns import campaign_interval_seconds, recalculate_campaign
+from api.services.campaigns import campaign_interval_seconds, claim_provider_send_slot, extend_provider_send_gate, provider_rate_limited, provider_retry_seconds, recalculate_campaign
 from api.services.media import ensure_media_ready
 from api.services.phones import normalize_tanzania_phone
 from api.services.wasender import (
@@ -67,14 +67,19 @@ def _validate_text(value):
 
 def provider_status_values(provider_payload):
     """Read acknowledgement variants without guessing beyond documented values."""
-    data = provider_payload.get("data", provider_payload) if isinstance(provider_payload, dict) else {}
-    data = data if isinstance(data, dict) else {}
+    payload = provider_payload if isinstance(provider_payload, dict) else {}
+    data_present = isinstance(payload.get("data"), dict)
+    data = payload.get("data") if data_present else payload
+    if not isinstance(data, dict): data = {}
     raw_status = data.get("status")
-    raw_code = data.get("ack")
-    if raw_code is None:
-        raw_code = data.get("statusCode", data.get("status_code"))
-    if raw_code is None and isinstance(raw_status, (int, float)):
-        raw_code = raw_status
+    raw_code = data.get("ack", data.get("statusCode", data.get("status_code")))
+    for value in (raw_status, data.get("messageStatus"), data.get("message_status"),
+                  (data.get("receipt") or {}).get("status") if isinstance(data.get("receipt"), dict) else None,
+                  (data.get("message") or {}).get("status") if isinstance(data.get("message"), dict) else None):
+        if raw_code is None and isinstance(value, (int, float)):
+            raw_code = value
+        if not raw_status and value is not None:
+            raw_status = value
     raw_text = data.get("statusText") or (raw_status if not isinstance(raw_status, (int, float)) else "") or ""
     return raw_code, raw_text
 
@@ -103,7 +108,7 @@ def apply_provider_status(entry, provider_payload, checked_at=None):
     entry.provider_status_checked_at = now
     entry.last_provider_payload = safe_provider_payload(provider_payload)
     entry.status_sync_failure_count = 0
-    entry.status_sync_error = ""
+    entry.status_sync_error = "" if normalized != "unknown" else "Provider response did not include a recognized acknowledgement."
     # Failures are meaningful only before a confirmed delivery acknowledgement.
     if normalized == "failed":
         if old_state not in DELIVERED_STATES:
@@ -136,6 +141,38 @@ def apply_provider_status(entry, provider_payload, checked_at=None):
     if entry.state != old_state:
         recalculate_campaign(entry.campaign_id, finalize=False)
     return entry, changed
+
+
+def apply_send_result(entry_id, provider_result, *, attempt_id=None, finished_at=None, duration_ms=0):
+    """Atomically persist an accepted provider response before status polling can see it."""
+    finished_at = finished_at or timezone.now()
+    payload = getattr(provider_result, "data", provider_result)
+    data = _provider_data(provider_result)
+    message_id = str(data.get("msgId") or data.get("id") or "").strip()
+    with transaction.atomic():
+        entry = CampaignRecipient.objects.select_for_update().select_related("campaign").get(pk=entry_id)
+        entry.state = CampaignRecipient.State.ACCEPTED
+        entry.provider_message_id = message_id
+        entry.provider_jid = str(data.get("jid") or "")[:255]
+        entry.attempt_finished_at = finished_at
+        entry.skip_reason = ""
+        entry.failed_at = None
+        entry.last_provider_payload = safe_provider_payload(payload)
+        entry.status_sync_error = "" if message_id else "Provider accepted the request but did not return a message ID."
+        entry.next_status_check_at = finished_at if message_id else None
+        entry.save(update_fields=["state", "provider_message_id", "provider_jid", "attempt_finished_at", "skip_reason", "failed_at", "last_provider_payload", "status_sync_error", "next_status_check_at", "updated_at"])
+        # This second save only observes acknowledgement fields; identity above is already durable.
+        if message_id:
+            entry, _ = apply_provider_status(entry, payload, checked_at=finished_at)
+        if attempt_id:
+            attempt = MessageAttempt.objects.select_for_update().get(pk=attempt_id)
+            attempt.http_status = getattr(provider_result, "http_status", None)
+            attempt.provider_response = safe_provider_payload(payload)
+            attempt.provider_message_id = message_id
+            attempt.duration_ms = duration_ms
+            attempt.save()
+        recalculate_campaign(entry.campaign_id, finalize=False)
+    return entry
 
 
 def record_status_sync_error(entry, exc, checked_at=None):
@@ -225,7 +262,7 @@ def delete_message(entry, client=None):
     return entry
 
 
-def resend_message(entry_id, owner_id, data, client=None):
+def _resend_message_legacy(entry_id, owner_id, data, client=None):
     text = _validate_text(data.get("text"))
     phone_result = normalize_tanzania_phone(data.get("phone"))
     if phone_result.status not in {"valid", "warning"}:
@@ -246,24 +283,12 @@ def resend_message(entry_id, owner_id, data, client=None):
             raise MessageActionError("Only failed messages can be resent.", status=409)
         if entry.provider_deleted_at:
             raise MessageActionError("A deleted provider message cannot be resent.", status=409)
-        latest = (
-            MessageAttempt.objects.filter(
-                campaign_recipient__campaign__owner_id=owner_id,
-                campaign_recipient__attempt_started_at__isnull=False,
-            ).order_by("-campaign_recipient__attempt_started_at")
-            .first()
-        )
         now = timezone.now()
         interval = campaign_interval_seconds(entry.campaign)
-        if latest and interval:
-            next_allowed = latest.campaign_recipient.attempt_started_at + timedelta(seconds=interval)
-            if next_allowed > now:
-                wait = max(1, math.ceil((next_allowed - now).total_seconds()))
-                raise MessageActionError(
-                    "The campaign send interval is still active.",
-                    status=429,
-                    data={"wait_seconds": wait},
-                )
+        claim = claim_provider_send_slot(requested_interval=interval, campaign_id=entry.campaign_id, recipient_id=entry.id)
+        if not claim["claimed"]:
+            raise MessageActionError("The provider queue requires a 5-second interval.", status=429,
+                                     data={"wait_seconds": claim["wait_seconds"], "next_allowed_at": claim["next_allowed_at"].isoformat()})
         unchanged = phone_result.normalized == entry.normalized_phone and text == entry.rendered_message
         entry.normalized_phone = phone_result.normalized
         entry.rendered_message = text
@@ -312,7 +337,7 @@ def resend_message(entry_id, owner_id, data, client=None):
             if ACK_LEVELS.get(entry.state, -1) >= ACK_LEVELS["sent"] and not entry.sent_at:
                 entry.sent_at = timezone.now()
             entry.save()
-            attempt.http_status = result.http_status
+            attempt.http_status = result.http_status if isinstance(result.http_status, int) else None
             attempt.provider_response = entry.last_provider_payload
             attempt.provider_message_id = entry.provider_message_id
             attempt.duration_ms = int((time.monotonic() - started) * 1000)
@@ -342,6 +367,49 @@ def resend_message(entry_id, owner_id, data, client=None):
     if failure:
         raise failure
     return entry
+
+
+def resend_message(entry_id, owner_id, data, client=None):
+    """Resend using the same global gate; the provider request is outside DB locks."""
+    text = _validate_text(data.get("text"))
+    phone_result = normalize_tanzania_phone(data.get("phone"))
+    if phone_result.status not in {"valid", "warning"}:
+        raise MessageActionError(phone_result.message or "Enter a valid Tanzania phone number.", fields={"phone": [phone_result.message]})
+    with transaction.atomic():
+        entry = CampaignRecipient.objects.select_for_update().select_related("campaign").get(pk=entry_id, campaign__owner_id=owner_id)
+        if entry.state != CampaignRecipient.State.FAILED or entry.provider_deleted_at:
+            raise MessageActionError("Only active failed messages can be resent.", status=409)
+        claim = claim_provider_send_slot(requested_interval=campaign_interval_seconds(entry.campaign), campaign_id=entry.campaign_id, recipient_id=entry.id)
+        if not claim["claimed"]:
+            raise MessageActionError("The provider queue requires a 5-second interval.", status=429, data={"wait_seconds": claim["wait_seconds"]})
+        native_resend = phone_result.normalized == entry.normalized_phone and text == entry.rendered_message and bool(entry.provider_message_id)
+        entry.normalized_phone, entry.rendered_message = phone_result.normalized, text
+        entry.state, entry.attempt_started_at, entry.provider_action_error = CampaignRecipient.State.PROCESSING, timezone.now(), ""
+        entry.save()
+        attempt = MessageAttempt.objects.create(campaign_recipient=entry, attempt_number=entry.attempts.count() + 1, request_payload={"to": text and entry.normalized_phone, "text": text})
+        provider_id, phone, message = entry.provider_message_id, entry.normalized_phone, entry.rendered_message
+    started = time.monotonic()
+    try:
+        result = (client or WasenderClient()).resend_message(provider_id) if native_resend else (client or WasenderClient()).send_message(phone, message)
+        entry = apply_send_result(entry.id, result, attempt_id=attempt.id, finished_at=timezone.now(), duration_ms=int((time.monotonic() - started) * 1000))
+        entry.retry_count += 1
+        entry.save(update_fields=["retry_count", "updated_at"])
+        return entry
+    except WasenderError as exc:
+        if provider_rate_limited(exc):
+            extend_provider_send_gate(provider_retry_seconds(exc, campaign_interval_seconds(entry.campaign)))
+        with transaction.atomic():
+            entry = CampaignRecipient.objects.select_for_update().get(pk=entry_id)
+            entry.state, entry.failed_at, entry.attempt_finished_at = CampaignRecipient.State.FAILED, timezone.now(), timezone.now()
+            entry.skip_reason, entry.provider_action_error = safe_provider_text(exc)[:255], safe_provider_text(exc)
+            entry.last_provider_payload = safe_provider_payload(exc.payload)
+            entry.save()
+            attempt = MessageAttempt.objects.select_for_update().get(pk=attempt.id)
+            attempt.http_status, attempt.provider_response, attempt.error_category, attempt.error_message = exc.status, entry.last_provider_payload, exc.category, entry.skip_reason
+            attempt.duration_ms = int((time.monotonic() - started) * 1000)
+            attempt.save()
+            recalculate_campaign(entry.campaign_id, finalize=False)
+        raise MessageActionError(entry.skip_reason, status=exc.status if exc.status and exc.status < 500 else 502)
 
 
 def message_queryset(owner):
@@ -398,6 +466,7 @@ def serialize_row(entry, serial_number=None):
         "provider_status_code": entry.provider_status_code,
         "provider_status_text": entry.provider_status_text,
         "provider_status_checked_at": stamp(entry.provider_status_checked_at),
+        "status_sync_error": entry.status_sync_error,
         "sent_at": stamp(entry.sent_at),
         "delivered_at": stamp(entry.delivered_at),
         "read_at": stamp(entry.read_at),
@@ -422,6 +491,7 @@ def serialize_row(entry, serial_number=None):
 def campaign_counts(campaign):
     campaign.refresh_from_db()
     return {
+        "pending": campaign.pending_count,
         "sent": campaign.sent_count,
         "delivered": campaign.delivered_count,
         "read": campaign.read_count,

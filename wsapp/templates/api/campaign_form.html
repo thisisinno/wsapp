@@ -10,16 +10,16 @@
       <textarea id="body" class="form-control" rows="8" required></textarea>
       <div class="d-flex mt-2"><select id="placeholder" class="form-select form-select-sm w-auto"><option value="">Insert placeholder…</option>{% for c in dataset.detected_columns %}<option value="{{ c.key }}">{{ c.label }}</option>{% endfor %}</select><span id="chars" class="ms-auto text-muted">0 characters</span></div>
       <fieldset class="mt-3"><legend class="h6">Delay between messages</legend>
-        <p class="small text-muted mb-2">Choose how long to wait before sending the next message.</p>
+        <p class="small text-muted mb-2">The provider account requires at least 5 seconds between message attempts. You may choose a longer delay.</p>
         <div class="d-flex flex-wrap gap-2">
-          <button type="button" class="btn btn-sm btn-outline-secondary campaign-interval" data-value="0">Immediate</button><button type="button" class="btn btn-sm btn-outline-secondary campaign-interval" data-value="1">1 sec</button><button type="button" class="btn btn-sm btn-outline-secondary campaign-interval" data-value="2">2 sec</button><button type="button" class="btn btn-sm btn-outline-secondary campaign-interval" data-value="5">5 sec</button><button type="button" class="btn btn-sm btn-outline-secondary campaign-interval" data-value="10">10 sec</button><button type="button" class="btn btn-sm btn-outline-secondary campaign-interval" data-value="30">30 sec</button><button type="button" class="btn btn-sm btn-outline-secondary campaign-interval" data-value="60">60 sec</button>
+          <button type="button" class="btn btn-sm btn-outline-secondary campaign-interval" data-value="5">5 sec</button><button type="button" class="btn btn-sm btn-outline-secondary campaign-interval" data-value="10">10 sec</button><button type="button" class="btn btn-sm btn-outline-secondary campaign-interval" data-value="15">15 sec</button><button type="button" class="btn btn-sm btn-outline-secondary campaign-interval" data-value="30">30 sec</button><button type="button" class="btn btn-sm btn-outline-secondary campaign-interval" data-value="60">60 sec</button>
         </div>
         <label class="form-label mt-2" for="sendInterval">Custom seconds (optional)</label>
         <input
           id="sendInterval"
           name="send_interval_seconds"
           type="number"
-          min="0"
+          min="5"
           max="3600"
           step="1"
           inputmode="numeric"
@@ -28,7 +28,7 @@
           aria-describedby="sendIntervalHelp sendIntervalFeedback"
         >
         <div id="sendIntervalFeedback" class="invalid-feedback" hidden></div>
-        <small id="sendIntervalHelp" class="text-muted">Leave blank to use the selected/default delay. Zero means no added delay; messages are still sent one at a time.</small>
+        <small id="sendIntervalHelp" class="text-muted">The provider account requires at least 5 seconds between message attempts. You may choose a longer delay.</small>
       </fieldset>
       <label class="form-label mt-3" for="media">Optional media</label>
       <input id="media" class="form-control" type="file" accept="image/*,video/mp4,audio/*,.pdf,.doc,.docx,.xls,.xlsx,.csv,.txt" aria-describedby="mediaFeedback">

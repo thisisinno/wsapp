@@ -1,6 +1,8 @@
 import json
 import base64
 from dataclasses import dataclass
+import re
+from urllib.parse import quote
 
 import requests
 from django.conf import settings
@@ -18,12 +20,21 @@ class RateLimitError(WasenderError): category = "rate_limit"
 class ConnectionError(WasenderError): category = "connection"
 class TimeoutError(WasenderError): category = "timeout"
 class MalformedResponseError(WasenderError): category = "malformed_response"
+class InvalidCheckResponseError(MalformedResponseError): category = "invalid_check_response"
 
 
 @dataclass
 class ProviderResult:
     data: dict
     http_status: int
+
+
+@dataclass(frozen=True)
+class WhatsAppNumberCheck:
+    phone: str
+    exists: bool
+    http_status: int
+    provider_payload: dict
 
 
 def _safe_message(value):
@@ -157,7 +168,18 @@ class WasenderClient:
             message = result.data.get("message") or result.data.get("error") or "Provider rejected the message."
             raise WasenderError(_safe_message(message), result.http_status, result.data)
         return result
-    def check_number(self, phone): return self._request("GET", f"/api/on-whatsapp/{phone}")
+    def check_number(self, phone) -> WhatsAppNumberCheck:
+        if not isinstance(phone, str) or not re.fullmatch(r"\+255\d{9}", phone):
+            raise ValidationError("A Tanzania E.164 number is required.")
+        result = self._request("GET", f"/api/on-whatsapp/{quote(phone, safe='')}")
+        payload = result.data
+        if payload.get("success") is not True:
+            message = payload.get("message") or payload.get("error") or "Provider rejected the registration check."
+            raise InvalidCheckResponseError(_safe_message(message), result.http_status, safe_provider_payload(payload))
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("exists"), bool):
+            raise InvalidCheckResponseError("Provider returned an invalid registration-check response.", result.http_status, safe_provider_payload(payload))
+        return WhatsAppNumberCheck(phone, data["exists"], result.http_status, safe_provider_payload(payload))
     def upload_media_raw(self, fileobj, mime):
         fileobj.seek(0)
         return self._request("POST", "/api/upload", headers={"Content-Type": mime}, data=fileobj)
@@ -222,7 +244,10 @@ class WasenderClient:
         return self._successful_action("PUT", f"/api/messages/{message_id}", json={"text": text})
 
     def message_info(self, message_id):
-        return self._successful_action("GET", f"/api/messages/{message_id}/info")
+        result = self._successful_action("GET", f"/api/messages/{quote(str(message_id), safe='')}/info")
+        if not isinstance(result.data.get("data"), dict):
+            raise MalformedResponseError("Provider returned invalid message-info data.", result.http_status, safe_provider_payload(result.data))
+        return result
 
     def delete_message(self, message_id):
         return self._successful_action("DELETE", f"/api/messages/{message_id}")

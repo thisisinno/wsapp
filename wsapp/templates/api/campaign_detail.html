@@ -3,7 +3,7 @@
 <div class="page-head">
   <div>
     <h1>{{ campaign.name }}</h1>
-    <p id="campaignStatus">{{ campaign.get_status_display }} · {% if campaign.send_interval_seconds == 0 %}No added delay between messages{% else %}{{ campaign.send_interval_seconds }} second{{ campaign.send_interval_seconds|pluralize }} between messages{% endif %}</p>
+    <p id="campaignStatus">{{ campaign.get_status_display }} · {{ campaign.send_interval_seconds }} second{{ campaign.send_interval_seconds|pluralize }} between messages</p>
   </div>
   <div class="d-flex gap-2 flex-wrap">
     <a class="btn btn-outline-secondary" href="{% url 'export_campaign' campaign.id %}">Export</a>
